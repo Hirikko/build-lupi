@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR"
 
-JOGO="$BUILD_DIR/lupi-codec-1.0.0/jogo"
-SDK_SRC="$BUILD_DIR/lupinho-sdk-main/src"
-CODEC_DIR="$BUILD_DIR/lupi-codec-1.0.0"
+JOGO="$BUILD_DIR/lupi-codec/jogo"
+SDK_SRC="$BUILD_DIR/lupinho-sdk/src"
+CODEC_DIR="$BUILD_DIR/lupi-codec"
 RELEASE_DIR="$CODEC_DIR/jogo-release"
 RELEASES_DIR="$RELEASE_DIR/releases"
 LUPI="$RELEASES_DIR/jogo.lupi"
-LUPINHO_SITE="$BUILD_DIR/lupinho-1.2.1/site"
+LUPINHO_SITE="$BUILD_DIR/lupinho/site"
 
 echo "[1/7] Limpando jogo..."
 	find "$JOGO" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
