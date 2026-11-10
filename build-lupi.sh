@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -59,7 +58,7 @@ Flags:
   --select, -s         Força o seletor interativo (mesmo com seletor=desliga)
   --cfg <op>           Altera configuração e CONTINUA o build.
   --cfg-only <op>      Altera configuração e SAI (sem build).
-                       Opções: seletor=liga | seletor=desliga
+                       Opções: seletor=liga|desliga, modo=dev|game|user, update=ask|silent
   --help, -h           Mostra esta ajuda
 EOF
             exit 0
@@ -124,22 +123,35 @@ install_packages() {
     esac
 }
 
-# --- .lupi-select helpers (formato: jogo=<nome>\nseletor=liga|desliga) ---
+# --- .lupi-select helpers ---
 select_migrate() {
     [ ! -f "$SELECT_FILE" ] && return 0
+    if grep -qE '^update=' "$SELECT_FILE" 2>/dev/null; then
+        return 0
+    fi
     if grep -qE '^jogo=' "$SELECT_FILE" 2>/dev/null; then
+        local jogo modo sel
+        jogo=$(select_get_jogo)
+        modo=$(select_get_modo)
+        sel=$(select_get_seletor)
+        printf "jogo=%s\nmodo=%s\nseletor=%s\nupdate=ask\n" "$jogo" "$modo" "$sel" > "$SELECT_FILE"
+        echo "  Migração .lupi-select: adicionado update=ask"
         return 0
     fi
     local old
     old=$(head -n1 "$SELECT_FILE" 2>/dev/null | tr -d '[:space:]')
     [ -z "$old" ] && return 0
     local sel="liga"
+    local modo="user"
+    [ "$old" = "caio-pernocas" ] && modo="game"
+    [ "$old" = "lupinho-debug-lab" ] && modo="dev"
+
     if [ -f "$SDK_SRC/.${old}-installed" ] && grep -qE '^making_game=1$' "$SDK_SRC/.${old}-installed" 2>/dev/null; then
         sel="desliga"
         sed -i '/^making_game=1$/d' "$SDK_SRC/.${old}-installed" 2>/dev/null || true
     fi
-    printf "jogo=%s\nseletor=%s\n" "$old" "$sel" > "$SELECT_FILE"
-    echo "  Migração .lupi-select: jogo=$old, seletor=$sel"
+    printf "jogo=%s\nmodo=%s\nseletor=%s\nupdate=ask\n" "$old" "$modo" "$sel" > "$SELECT_FILE"
+    echo "  Migração .lupi-select: jogo=$old, modo=$modo, seletor=$sel, update=ask"
 }
 
 select_get_jogo() {
@@ -152,6 +164,19 @@ select_get_jogo() {
     fi
 }
 
+select_get_modo() {
+    if [ -f "$SELECT_FILE" ]; then
+        local v
+        v=$(grep -E '^modo=' "$SELECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '[:space:]')
+        [ -n "$v" ] && { echo "$v"; return; }
+    fi
+    local j
+    j=$(select_get_jogo)
+    [ "$j" = "caio-pernocas" ] && echo "game" && return
+    [ "$j" = "lupinho-debug-lab" ] && echo "dev" && return
+    echo "user"
+}
+
 select_get_seletor() {
     if [ -f "$SELECT_FILE" ]; then
         local v
@@ -161,18 +186,45 @@ select_get_seletor() {
     echo "liga"
 }
 
+select_get_update() {
+    if [ -f "$SELECT_FILE" ]; then
+        local v
+        v=$(grep -E '^update=' "$SELECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '[:space:]')
+        [ -n "$v" ] && { echo "$v"; return; }
+    fi
+    echo "ask"
+}
+
 select_set_jogo() {
     local jogo="$1"
-    local sel
-    sel=$(select_get_seletor)
-    printf "jogo=%s\nseletor=%s\n" "$jogo" "$sel" > "$SELECT_FILE"
+    local sel=$(select_get_seletor)
+    local modo=$(select_get_modo)
+    local upd=$(select_get_update)
+    printf "jogo=%s\nmodo=%s\nseletor=%s\nupdate=%s\n" "$jogo" "$modo" "$sel" "$upd" > "$SELECT_FILE"
+}
+
+select_set_modo() {
+    local modo="$1"
+    local jogo=$(select_get_jogo)
+    local sel=$(select_get_seletor)
+    local upd=$(select_get_update)
+    printf "jogo=%s\nmodo=%s\nseletor=%s\nupdate=%s\n" "$jogo" "$modo" "$sel" "$upd" > "$SELECT_FILE"
 }
 
 select_set_seletor() {
     local sel="$1"
-    local jogo
-    jogo=$(select_get_jogo)
-    printf "jogo=%s\nseletor=%s\n" "$jogo" "$sel" > "$SELECT_FILE"
+    local jogo=$(select_get_jogo)
+    local modo=$(select_get_modo)
+    local upd=$(select_get_update)
+    printf "jogo=%s\nmodo=%s\nseletor=%s\nupdate=%s\n" "$jogo" "$modo" "$sel" "$upd" > "$SELECT_FILE"
+}
+
+select_set_update() {
+    local upd="$1"
+    local jogo=$(select_get_jogo)
+    local modo=$(select_get_modo)
+    local sel=$(select_get_seletor)
+    printf "jogo=%s\nmodo=%s\nseletor=%s\nupdate=%s\n" "$jogo" "$modo" "$sel" "$upd" > "$SELECT_FILE"
 }
 
 # --- Processa --cfg ---
@@ -195,19 +247,38 @@ process_cfg_op() {
             esac
             select_set_seletor "$val"
             echo "  Configurado: seletor=$val"
-            if [ "$only" -eq 1 ]; then
-                echo "  (--cfg-only: build não executado)"
-                exit 0
-            fi
-            echo "  Continuando com o build..."
-            echo ""
+            ;;
+        modo=*)
+            local val="${op#modo=}"
+            case "$val" in
+                dev|game|user) ;;
+                *) echo "Valor inválido: '$val' (use dev, game ou user)"; exit 1 ;;
+            esac
+            select_set_modo "$val"
+            echo "  Configurado: modo=$val"
+            ;;
+        update=*)
+            local val="${op#update=}"
+            case "$val" in
+                ask|sim|perguntar)        val="ask" ;;
+                silent|nunca|silenciar)   val="silent" ;;
+                *) echo "Valor inválido: '$val' (use ask ou silent)"; exit 1 ;;
+            esac
+            select_set_update "$val"
+            echo "  Configurado: update=$val"
             ;;
         *)
             echo "Opção --cfg desconhecida: $op"
-            echo "Opções: seletor=liga, seletor=desliga"
+            echo "Opções: seletor=liga, seletor=desliga, modo=dev, modo=game, update=ask, update=silent"
             exit 1
             ;;
     esac
+    if [ "$only" -eq 1 ]; then
+        echo "  (--cfg-only: build não executado)"
+        exit 0
+    fi
+    echo "  Continuando com o build..."
+    echo ""
 }
 
 if [ -n "$CFG_OP" ]; then
@@ -321,7 +392,7 @@ check_system_dependencies() {
         fi
     done
     command -v lua &>/dev/null || {
-        if [ "$OS" = "linux" ]; then missing+=("lua5.5" "liblua5.5-dev")
+        if [ "$OS" = "linux" ]; then missing+=("lua5.3" "liblua5.3-dev")
         else missing+=("lua")
         fi
     }
@@ -475,10 +546,8 @@ install_furnace() {
 install_wav2vgm() { git_sync_dir "$WAV2VGM_DIR" "https://github.com/Hirikko/WAV2VGM.git" "cli"; }
 install_vgm2fur() { git_sync_dir "$VGM2FUR_DIR" "https://github.com/Hirikko/vgm2fur.git" "cli"; }
 
-# --- Sincronização do repositório build-lupi ---
+# --- Sincronização e Auto-Update do build-lupi ---
 install_build_lupi() {
-    # Se o script já está rodando de dentro da própria pasta build-lupi,
-    # não tenta clonar dentro de si mesmo (evita loop).
     local script_real
     script_real=$(cd "$SCRIPT_DIR" && pwd -P)
     local target_real
@@ -493,7 +562,111 @@ install_build_lupi() {
         return 0
     fi
 
-    git_sync_dir "$BUILD_LUPI_DIR" "$BUILD_LUPI_URL" "main"
+    if [ ! -d "$BUILD_LUPI_DIR/.git" ]; then
+        git_sync_dir "$BUILD_LUPI_DIR" "$BUILD_LUPI_URL" "main"
+        return 0
+    fi
+
+    cd "$BUILD_LUPI_DIR" || return 0
+
+    local current_branch
+    current_branch=$(git branch --show-current 2>/dev/null || echo "main")
+    [ -z "$current_branch" ] && current_branch="main"
+
+    if ! git fetch origin "$current_branch" --quiet 2>/dev/null; then
+        echo "  Aviso: git fetch falhou em build-lupi."
+        cd "$SCRIPT_DIR"
+        return 0
+    fi
+
+    local local_hash remote_hash
+    local_hash=$(git rev-parse HEAD 2>/dev/null || echo "")
+    remote_hash=$(git rev-parse "origin/$current_branch" 2>/dev/null || echo "")
+
+    if [ -z "$remote_hash" ] || [ "$local_hash" = "$remote_hash" ]; then
+        cd "$SCRIPT_DIR"
+        return 0
+    fi
+
+    local behind
+    behind=$(git rev-list --count "HEAD..origin/$current_branch" 2>/dev/null || echo "0")
+    if [ "$behind" -eq 0 ]; then
+        cd "$SCRIPT_DIR"
+        return 0
+    fi
+
+    echo ""
+    echo "  build-lupi: $behind commit(s) novo(s) no remote (local ${local_hash:0:8} -> remote ${remote_hash:0:8})."
+
+    local upd_mode
+    upd_mode=$(select_get_update)
+    if [ "$upd_mode" = "silent" ]; then
+        echo "  update=silent: atualização ignorada (próximas execuções não perguntarão)."
+        cd "$SCRIPT_DIR"
+        return 0
+    fi
+
+    echo ""
+    echo "  O que deseja fazer?"
+    echo "    1) Atualizar o script agora"
+    echo "    2) Não atualizar agora (me lembrar na próxima execução)"
+    echo "    3) Não atualizar nunca (não me lembrar mais)"
+    echo ""
+    read -p "  Escolha [1/2/3]: " _upd_choice
+
+    case "$_upd_choice" in
+        1)
+            echo "  Atualizando..."
+            ;;
+        2)
+            echo "  Aviso: atualização adiada. Vou perguntar de novo na próxima execução."
+            cd "$SCRIPT_DIR"
+            return 0
+            ;;
+        3)
+            select_set_update "silent"
+            echo "  Aviso: atualizações silenciadas. Use '--cfg update=ask' para reativar."
+            cd "$SCRIPT_DIR"
+            return 0
+            ;;
+        *)
+            echo "  Opção inválida. Seguindo sem atualizar."
+            cd "$SCRIPT_DIR"
+            return 0
+            ;;
+    esac
+
+    local root_script="$SCRIPT_DIR/build-lupi.sh"
+    local repo_script="$BUILD_LUPI_DIR/build-lupi.sh"
+    local bkps_dir="$BUILD_LUPI_DIR/bkps"
+
+    if [ -f "$root_script" ]; then
+        mkdir -p "$bkps_dir"
+        local ts
+        ts=$(date +%Y%m%d-%H%M%S)
+        cp -f "$root_script" "$bkps_dir/build-lupi-$ts.sh" 2>/dev/null && \
+            echo "  Backup do script anterior: build-lupi/bkps/build-lupi-$ts.sh"
+    fi
+
+    if ! git merge --ff-only "origin/$current_branch" --quiet 2>/dev/null; then
+        echo "  Aviso: fast-forward falhou, tentando pull..."
+        if ! git pull --no-rebase origin "$current_branch" --quiet 2>/dev/null; then
+            echo "  Aviso: conflitos em build-lupi. Resolva manualmente e rode de novo."
+            cd "$SCRIPT_DIR"
+            return 0
+        fi
+    fi
+
+    echo "  build-lupi atualizado para $(git rev-parse --short HEAD)."
+
+    if [ -f "$repo_script" ]; then
+        cp -f "$repo_script" "$root_script"
+        chmod +x "$root_script" 2>/dev/null || true
+        echo "  Script da raiz substituído pela versão nova."
+        echo "  (A versão nova entra em vigor na PRÓXIMA execução; esta continua com a atual.)"
+    fi
+
+    cd "$SCRIPT_DIR"
 }
 
 force_sync_demo() {
@@ -701,11 +874,12 @@ choose_game_selection() {
 
     step " Seletor de jogo"
     echo "Jogo atual em src/: $current"
+    echo "Modo de compilação atual: $(select_get_modo)"
     echo ""
     echo "Qual jogo deseja compilar?"
-    echo "  1) Caio-Pernocas     (build web   — sem furnace)"
-    echo "  2) Lupinho Debug Lab (build debug — com furnace)"
-    echo "  3) Outro (pasta em jogos-demo/)"
+    echo "  1) Caio-Pernocas"
+    echo "  2) Lupinho Debug Lab"
+    echo "  3) Outro (pasta em: jogos-demo/)"
     echo ""
 
     local extras
@@ -718,7 +892,7 @@ choose_game_selection() {
         echo ""
     fi
 
-    read -p "Escolha [1/2/3]: " _choice
+    read -p "Escolha [1/2/3] ou nome da pasta em jogos-demo/: " _choice
     local chosen=""
     case "$_choice" in
         1) chosen="caio-pernocas" ;;
@@ -732,10 +906,19 @@ choose_game_selection() {
             fi
             chosen="$_custom"
             ;;
-        *) echo "Opção inválida."; exit 1 ;;
+        *)
+            local _custom
+            _custom=$(echo "$_choice" | tr -d '[:space:]')
+            if [ -n "$_custom" ] && [ -d "$DEMOS_DIR/$_custom" ]; then
+                chosen="$_custom"
+            else
+                echo "Opção inválida: '$_choice' não corresponde a 1/2/3 nem a uma pasta em jogos-demo/."
+                exit 1
+            fi
+            ;;
     esac
     select_set_jogo "$chosen"
-    echo "  Seleção salva: $chosen"
+    echo "  Seleção salva: $chosen (modo: $(select_get_modo))"
 }
 
 swap_src_to_demo() {
@@ -1026,6 +1209,20 @@ check_lupinho_build() {
         if [ -n "$make_dir" ]; then
             cd "$make_dir"
             if [ "$MODE" = "dev" ]; then
+                if [ ! -f "$libfile" ]; then
+                    echo ""
+                    echo "ERRO: libfurengine.a não encontrada, mas o modo é DEV."
+                    echo "O 'make debug' falharia porque a biblioteca do Furnace está ausente."
+                    echo ""
+                    echo "Para regenerar a biblioteca do Furnace manualmente, execute:"
+                    echo "  cd $LUPINHO_DIR/src/music"
+                    echo "  chmod +x build_furnace.sh"
+                    echo "  ./build_furnace.sh web ../furnace ../libs/web/furnace-web"
+                    echo ""
+                    echo "Ou rode './build-lupi.sh' novamente e escolha a opção 2 no menu do Furnace."
+                    echo ""
+                    exit 1
+                fi
                 [ ! -f "$fur_obj" ] && { compile_fur_player_obj || exit 1; cd "$LUPINHO_DIR/$make_dir"; }
                 make debug
             else
@@ -1050,19 +1247,19 @@ check_lupinho_build() {
 }
 
 migrate_mode_to_select() {
-    if [ -f "$SELECT_FILE" ] && grep -qE '^jogo=' "$SELECT_FILE" 2>/dev/null; then
+    if [ -f "$SELECT_FILE" ] && grep -qE '^update=' "$SELECT_FILE" 2>/dev/null; then
         return 0
     fi
     if [ ! -f "$SELECT_FILE" ] && [ -f "$MODE_FILE" ]; then
         local _old
         _old=$(cat "$MODE_FILE" 2>/dev/null | tr -d '[:space:]')
         case "$_old" in
-            dev)  printf "jogo=lupinho-debug-lab\nseletor=liga\n" > "$SELECT_FILE" ;;
-            game) printf "jogo=caio-pernocas\nseletor=liga\n" > "$SELECT_FILE" ;;
-            user) printf "jogo=user\nseletor=liga\n" > "$SELECT_FILE" ;;
+            dev)  printf "jogo=lupinho-debug-lab\nmodo=dev\nseletor=liga\nupdate=ask\n" > "$SELECT_FILE" ;;
+            game) printf "jogo=caio-pernocas\nmodo=game\nseletor=liga\nupdate=ask\n" > "$SELECT_FILE" ;;
+            user) printf "jogo=user\nmodo=user\nseletor=liga\nupdate=ask\n" > "$SELECT_FILE" ;;
         esac
         if [ -f "$SELECT_FILE" ]; then
-            echo "  Migração: .lupi-mode ($_old) → .lupi-select (jogo=$(select_get_jogo), seletor=liga)"
+            echo "  Migração: .lupi-mode ($_old) → .lupi-select (jogo=$(select_get_jogo), modo=$_old, seletor=liga, update=ask)"
             rm -f "$MODE_FILE"
         fi
     fi
@@ -1078,56 +1275,78 @@ check_dependencies() {
     select_migrate
     migrate_flat_backups
 
-    if [ "$MISSING" -eq 1 ]; then
-        echo "Clonando repositórios base (primeira execução)..."
+    local is_first_run=0
+
+    if [ ! -f "$SELECT_FILE" ]; then
+        is_first_run=1
+        step " Primeira execução detectada"
+        echo "Deseja baixar a versão DEV (completa) ou GAME (somente essencial)?"
+        read -p "[dev/game]: " first_choice
+
+        echo "Clonando repositórios base..."
+        git_sync_dir "$LUPINHO_DIR" "https://github.com/Hirikko/lupinho.git" "dev"
+        git_sync_dir "$SDK_DIR" "https://github.com/lupi-org-br/lupinho-sdk.git"
+        git_sync_dir "$CODEC_DIR" "https://github.com/Hirikko/lupi-codec.git" "upgrades"
+        install_build_lupi
+
+        case "$first_choice" in
+            dev)
+                printf "jogo=lupinho-debug-lab\nmodo=dev\nseletor=liga\nupdate=ask\n" > "$SELECT_FILE"
+                echo "  Configurado para DEV (Lupinho Debug Lab)"
+                ;;
+            game)
+                printf "jogo=caio-pernocas\nmodo=game\nseletor=liga\nupdate=ask\n" > "$SELECT_FILE"
+                echo "  Configurado para GAME (Caio-Pernocas)"
+                ;;
+            *)
+                echo "Opção inválida. Usando 'game' como padrão."
+                printf "jogo=caio-pernocas\nmodo=game\nseletor=liga\nupdate=ask\n" > "$SELECT_FILE"
+                ;;
+        esac
+    elif [ "$MISSING" -eq 1 ]; then
+        echo "Algumas dependências estão faltando (pastas deletadas)."
+        echo "Clonando repositórios base..."
         git_sync_dir "$LUPINHO_DIR" "https://github.com/Hirikko/lupinho.git" "dev"
         git_sync_dir "$SDK_DIR" "https://github.com/lupi-org-br/lupinho-sdk.git"
         git_sync_dir "$CODEC_DIR" "https://github.com/Hirikko/lupi-codec.git" "upgrades"
         install_build_lupi
     fi
 
-    local already_selected=0
-    if [ ! -f "$SELECT_FILE" ]; then
-        echo "  Primeira execução: criando .lupi-select (seletor=liga por padrão)."
-        choose_game_selection
-        already_selected=1
-    fi
-
-    local cur_seletor cur_jogo
+    local cur_seletor cur_jogo cur_modo
     cur_seletor=$(select_get_seletor)
     cur_jogo=$(select_get_jogo)
+    cur_modo=$(select_get_modo)
 
-    if [ "$already_selected" -eq 1 ]; then
+    if [ "$is_first_run" -eq 1 ]; then
         GAME_SELECTION="$cur_jogo"
+        echo "Jogo inicial selecionado: $GAME_SELECTION"
     elif [ "$FORCE_SELECT" -eq 1 ]; then
         choose_game_selection
         GAME_SELECTION=$(select_get_jogo)
+        cur_modo=$(select_get_modo)
     elif [ "$cur_seletor" = "desliga" ]; then
         GAME_SELECTION="$cur_jogo"
         echo "  seletor=desliga: usando '$GAME_SELECTION' (src/ preservado)"
     elif [ -n "$CLI_GAME" ]; then
         GAME_SELECTION="$CLI_GAME"
         select_set_jogo "$GAME_SELECTION"
+        cur_modo=$(select_get_modo)
         echo "  Seleção via CLI: $GAME_SELECTION"
     else
         choose_game_selection
         GAME_SELECTION=$(select_get_jogo)
+        cur_modo=$(select_get_modo)
     fi
 
     [ -z "$GAME_SELECTION" ] && { echo "Erro: nenhum jogo selecionado."; exit 1; }
 
-    case "$GAME_SELECTION" in
-        caio-pernocas)     MODE="game" ; GAME_NAME="caio-pernocas" ;;
-        lupinho-debug-lab) MODE="dev"  ; GAME_NAME="lupinho-debug-lab" ;;
-        *)
-            MODE="user"
-            GAME_NAME="$GAME_SELECTION"
-            if [ ! -d "$DEMOS_DIR/$GAME_SELECTION" ]; then
-                echo "Seleção '$GAME_SELECTION' inválida (pasta não existe em jogos-demo/)."
-                exit 1
-            fi
-            ;;
-    esac
+    MODE="$cur_modo"
+    GAME_NAME="$GAME_SELECTION"
+
+    if [ "$MODE" = "user" ] && [ ! -d "$DEMOS_DIR/$GAME_SELECTION" ] && [ "$GAME_SELECTION" != "caio-pernocas" ] && [ "$GAME_SELECTION" != "lupinho-debug-lab" ]; then
+        echo "Seleção '$GAME_SELECTION' inválida (pasta não existe em jogos-demo/)."
+        exit 1
+    fi
 
     echo "Jogo selecionado: $GAME_SELECTION (modo: $MODE)"
 
@@ -1164,20 +1383,9 @@ check_dependencies() {
         return 0
     fi
 
+    # Informa a troca (o backup é feito dentro de swap_src_to_demo)
     if [ -n "$current_in_src" ]; then
         echo "  Jogo atual em src/: $current_in_src → trocando para $GAME_SELECTION"
-        if [ "$current_in_src" = "user-game" ]; then
-            if [ -n "$CLI_GAME" ]; then
-                backup_src "user-game"
-            else
-                read -p "  Fazer backup do jogo do usuário? (s/n): " _ans
-                if [[ "$_ans" =~ ^[Ss]$ ]]; then
-                    backup_src "user-game"
-                fi
-            fi
-        else
-            backup_src "$current_in_src"
-        fi
     fi
 
     swap_src_to_demo "$GAME_SELECTION" || true
