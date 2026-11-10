@@ -1,301 +1,580 @@
-# build-lupi.sh — Compilador e Empacotador de Jogos Lupi
-Script Bash que automatiza o fluxo completo de compilação, empacotamento e execução de jogos para o console **Lupi** e o simulador **Lupinho**. 
-Cuida da sincronização dos repositórios, compilação do Furnace e do Lupinho (WASM), geração do release via `lupi-codec`, e serve o jogo em `http://localhost:8080`.
+
+# 🎮 Build Lupi — Compilador e Empacotador de Jogos
+**Automatização completa do fluxo de desenvolvimento, compilação, empacotamento e execução de jogos para o console Lupi e o simulador Lupinho.**
+
+O `build-lupi.sh` é um script Bash que automatiza o ambiente de desenvolvimento do ecossistema Lupi.
+Ele gerencia a sincronização dos repositórios, instalação de dependências, seleção de jogos, backups automáticos, integração com Furnace, compilação do Lupinho em WebAssembly (WASM) e geração do pacote final `.lupi` através do `lupi-codec`.
+
+Ao finalizar o processo, também inicia um servidor HTTP local para executar e testar o simulador diretamente no navegador.
+
+O objetivo é simplificar todo o processo de build, evitando configurações manuais, protegendo os projetos e reaproveitando compilações existentes sempre que possível.
 
 ---
+## ✨ Funcionalidades
+- **Automação de dependências:** verifica ferramentas necessárias e oferece a instalação das que estiverem ausentes.
+- **Gerenciamento do Emscripten:** detecta, instala e configura automaticamente o Emscripten SDK.
+- **Sincronização Git:** clona e atualiza os repositórios utilizados pelo ambiente.
+- **Seletor interativo:** permite alternar entre jogos de demonstração e projetos personalizados.
+- **Modo de desenvolvimento contínuo:** preserva o conteúdo de `lupinho-sdk/src/`, evitando substituições indesejadas.
+- **Backups inteligentes:** detecta modificações nos arquivos do projeto através de hashes SHA-256.
+- **Backups rotativos:** mantém até 9 backups independentes por jogo.
+- **Integração com Furnace:** gerencia a biblioteca de áudio e os artefatos necessários para o modo DEV.
+- **Build inteligente:** verifica arquivos, artefatos, modos de compilação e caches antes de recompilar.
+- **Geração de releases:** utiliza o `lupi-codec` para produzir o pacote final `.lupi`.
+- **Servidor local:** disponibiliza o simulador através de HTTP na porta 8080.
 ## 📋 Requisitos
-- **Bash** 4.0+ (use `./build-lupi.sh` ou `bash build-lupi.sh`, **não** `sh build-lupi.sh`)
-- **Git** (para sincronização dos repositórios)
-- **Lua 5.5+** (para o `lupi-codec`)
-- **ImageMagick** (`magick` no `PATH`)
-- **zip**, **curl**, **python3**
-- **Emscripten SDK** (`emsdk`) no `PATH` — necessário apenas para compilar o Lupinho/Furnace
-- **cmake**, **ninja** — para compilar o Furnace em modo DEV
----
-## 📁 Estrutura de Pastas
-Após a primeira execução, o script organiza os arquivos assim:
-````
-raiz-do-projeto/
-├── build-lupi.sh
-├── .lupi-mode ← persiste a escolha DEV/GAME (criado automaticamente)
-├── jogos-demo/ ← cache dos jogos demo (clonados via git)
-│ ├── caio-pernocas/ (modo GAME)
-│ └── lupinho-debug-lab/ (modo DEV)
-├── lupinho/ ← simulador (fork: Hirikko/lupinho:dev)
-│ ├── src/
-│ │ ├── furnace/ ← tracker (fork: Hirikko/furnace:cli) — só DEV
-│ │ ├── music/
-│ │ │ └── build_furnace.sh
-│ │ └── libs/web/furnace-web/
-│ │ └── libfurengine.a ← gerado após compilar o Furnace
-│ └── site/
-│ └── dist/ ← game.wasm, game.html, game.js (saída da compilação do lupinho)
-├── lupinho-sdk/ ← SDK com template de jogo
-│ └── src/ ← jogo do usuário ou demo copiado
-│ ├── game.lua ou main.lua
-│ ├── lupi.yaml ← metadados do jogo (obrigatório)
-│ └── ...
-├── lupi-codec/ ← codec de empacotamento (fork: Hirikko/lupi-codec:upgrades)
-│ ├── wav2vgm/ ← só DEV
-│ ├── vgm2fur/ ← só DEV
-│ └── jogo-release/
-│ └── releases/
-│ ├── <timestamp>/ ← releases versionados
-│ └── jogo.lupi ← arquivo compactado (temporário)
-├── lupinho-debug-lab.lupi ← release do demo (só DEV)
-├── caio-pernocas.lupi ← release do demo (só GAME)
-└── <nome-do-jogo>.lupi ← release final do jogo atual
-````
----
-## 🎮 Modos de Uso
-O script opera em três modos, detectados automaticamente:
+### Sistemas operacionais
+- Linux.
+- macOS.
+### Ferramentas necessárias
 
-| Modo | Quando é usado | O que faz |
-| :--- | :--- | :--- |
-| **`dev`** | Primeira execução escolhendo `dev` ou `.lupi-mode` = `dev` | Instala Debug Lab + furnace + wav2vgm + vgm2fur. Compila o Lupinho em modo `debug` (com painel de hardware). |
-| **`game`** | Primeira execução escolhendo `game` ou `.lupi-mode` = `game` | Instala Caio-Pernocas como jogo de exemplo. Compila o Lupinho em modo `web` (build de produção). |
-| **`user`** | `lupinho-sdk/src/` já tem `main.lua`/`game.lua`/`lupi.yaml` e não há marcador de demo | Usa o jogo do usuário sem sobrescrever nada. Modo automático para desenvolvimento próprio. |
+| Dependência      | Finalidade                          |
+| ---------------- | ----------------------------------- |
+| Bash             | Execução do script                  |
+| Git              | Sincronização dos repositórios      |
+| Make             | Compilação                          |
+| CMake            | Configuração do Furnace             |
+| Ninja            | Sistema de build                    |
+| ZIP              | Empacotamento                       |
+| Curl             | Transferências                      |
+| Python 3         | Servidor HTTP                       |
+| ImageMagick      | Processamento de imagens            |
+| Lua5.5           | Execução do Lupinho Codec e lupinho |
+| Emscripten SDK   | Compilação WebAssembly              |
+| Emscripten C/C++ | Compilação de código C/C++          |
 
-A escolha fica persistida em `.lupi-mode` na raiz. Para trocar, remova o arquivo (ou edite) e rode novamente.
+O Emscripten é necessário para compilar o Lupinho e seus componentes Web. O Furnace também utiliza CMake e Ninja durante sua compilação.
+### Gerenciadores de pacotes suportados
+**Linux:**
+- APT
+- DNF
+- Pacman
+
+**macOS:** (Não foi Testado)
+- Homebrew
+
+> **Observação:** o script verifica a presença do comando `lua`, mas não valida sua versão. No Linux, quando necessário, tenta instalar Lua 5.3 e seus arquivos de desenvolvimento. A versão efetivamente compatível deve atender às dependências do codec utilizado.
+
+> **macOS:** instale Bash 4 ou superior. A versão fornecida originalmente pelo sistema pode não ser compatível com o script. Algumas operações também utilizam ferramentas e opções típicas do GNU/Linux, portanto a compatibilidade completa com macOS deve ser verificada.
 
 ---
-## 🚀 Primeira Execução
+## 🚀 Instalação
+Clone o repositório:
+```bash
+git clone https://github.com/Hirikko/build-lupi.git
+```
 
+Entre na pasta:
+```bash
+cd build-lupi
+```
+
+Dê permissão de execução:
+```bash
+chmod +x build-lupi.sh
+```
+
+Execute:
 ```bash
 ./build-lupi.sh
 ```
-O script vai:
-1. Detectar que faltam dependências e perguntar: [dev/game]
-2. Clonar os repositórios correspondentes via git
-3. Clonar o demo correspondente em jogos-demo/ (cache) e copiar para lupinho-sdk/src/
-4. Perguntar se deseja compilar o Lupinho (e o Furnace, se DEV)
-5. Gerar o release via lupi-codec
-6. Compactar o .lupi com o nome correto
-7. Iniciar o servidor em http://localhost:8080
-## Exemplo (modo DEV)
-```text
-Algumas dependências estão faltando.
-Deseja baixar a versão DEV (completa) ou GAME (somente essencial)?
-[dev/game]: dev
-Clonando lupinho...
-Clonando lupinho-sdk...
-Clonando lupi-codec...
-Clonando furnace...
-Clonando wav2vgm...
-Clonando vgm2fur...
-Clonando lupinho-debug-lab...
-Arquivos de lupinho-debug-lab copiados para .../lupinho-sdk/src
-Nome do jogo: lupinho-debug-lab
-Arquivos ausentes em site/dist: game.wasm game.html game.js
-Deseja compilar agora: Furnace (build_furnace.sh) e depois Lupinho (make debug)? (s/n): s
-...
-Lupinho compilado com sucesso.
-[1/7] ... [7/7] Servidor em http://localhost:8080
-```
-## 🔄 Execuções Subsequentes
-```bash
-./build-lupi.sh
-```
-O script vai:
-1. Verificar atualizações nas dependências via `git fetch`/`pull` (só puxa objetos se houver commits novos)
-2. **Preservar** o jogo em `lupinho-sdk/src/` se houver `main.lua`/`game.lua`/`lupi.yaml`
-3. Pular compilação se `site/dist/game.wasm`, `game.html` e `game.js` já existirem
-4. Em DEV, verificar se o Furnace está compilado (`libfurengine.a`); se não estiver, perguntar
-5. Gerar o release e subir webserver local de python3 em `http://localhost:8080`
-### Exemplo (modo USER)
-```text
-Verificando atualizações nas dependências (modo: user)...
-Jogo do usuário detectado em .../lupinho-sdk/src. Preservando.
-Furnace já clonado e compilado (libfurengine.a presente).
-Nome do jogo: sonic-1-sms
-Lupinho já compilado (game.wasm, game.html e game.js encontrados).
-...
-Arquivo final: /home/.../sonic-1-sms.lupi
-```
----
-## 🎨 Detecção do Nome do Jogo
-O nome do `.lupi` final segue esta ordem de prioridade:
-1. **Variável de ambiente** `GAME_NAME` (override manual)
-2. **`lupi.yaml`** em `lupinho-sdk/src/` — campo `name:` normalizado
-3. **Marcador** do demo (`.caio-pernocas-installed` → `caio-pernocas`, `.lupinho-debug-lab-installed` → `lupinho-debug-lab`)
-4. **Nome da pasta** onde está o `build-lupi.sh` (fallback)
-Exemplo de `lupi.yaml`:
-```yaml
-name: Sonic 1 SMS
-public: true
-version: 1.0
-```
-Vira `sonic-1-sms.lupi` (minúsculas, espaços → hífen, apenas `a-z0-9-`).
-Para sobrescrever manualmente:
-```bash
-GAME_NAME=sonic-1-sms-dev ./build-lupi.sh
-```
----
-## 🔥 Compilação do Furnace (modo DEV)
-O Furnace é compilado uma única vez, gerando `libfurengine.a` em `lupinho/src/libs/web/furnace-web/`.
-O script verifica:
 
-|Estado|Comportamento|
-|---|---|
-|Pasta + `libfurengine.a`|Silencioso, segue o fluxo|
-|Pasta clonada mas sem `lib`|Pergunta `[1/2/3]` a cada execução|
-|Sem pasta e sem `lib`|Pergunta `[1/2/3]`|
-Menu de escolha:
-```text
-O que deseja fazer?
-  1) Clonar Furnace (sem compilar)
-  2) Clonar e compilar Furnace
-  3) Nada (seguir com o que já está compilado)
-```
-- **Opção 1**: clona se necessário, mas não compila. Na próxima execução, o script vai perguntar de novo.
-- **Opção 2**: clona, inicializa submódulos e executa `build_furnace.sh`.
-- **Opção 3**: segue sem mexer. Se `lib` não existir, avisa que recompilar o Lupinho pode falhar no link.
-### Forçar recompilação manual
+Também é possível executar diretamente pelo Bash:
 ```bash
-rm lupinho/src/libs/web/furnace-web/libfurengine.a
-./build-lupi.sh
+bash build-lupi.sh
 ```
-Na próxima execução, o script detecta a ausência e oferece recompilar.
+
+**Importante:** não execute com `sh build-lupi.sh`, pois o script utiliza recursos específicos do Bash.
+### Primeira execução
+Na primeira execução, o script realiza as seguintes operações:
+
+1. Detecta o sistema operacional e verifica as dependências.
+2. Localiza ou instala o Emscripten SDK.
+3. Clona os repositórios necessários.
+4. Configura os componentes do ambiente.
+5. Sincroniza os jogos de demonstração.
+6. Cria a configuração `.lupi-select`.
+7. Apresenta o seletor interativo de jogos.
+8. Prepara o projeto para compilação e empacotamento.
+
+Algumas operações solicitam confirmação do usuário, especialmente instalação de pacotes, seleção de jogos e compilação de componentes.
 
 ---
-## 🧱 Compilação do Lupinho (WASM)
-Verificados três arquivos em `lupinho/site/dist/`:
-- `game.wasm`
-- `game.html`
-- `game.js`
-Se algum faltar, o script pergunta se deseja compilar:
-- **`make web`** (modo GAME e USER)
-- **`make debug`** (modo DEV — inclui painel `LUPI HARDWARE DEBUG`)
+## 🎛️ Interface de linha de comando
+O script possui uma CLI que permite controlar a seleção de jogos e as configurações do ambiente.
 
-O `Makefile` é procurado em em `lupinho/src/`.
+| Comando                                      | Comportamento                                    |
+| -------------------------------------------- | ------------------------------------------------ |
+| `./build-lupi.sh`                            | Executa o build conforme a configuração atual.   |
+| `./build-lupi.sh <nome-do-jogo>`             | Seleciona diretamente um jogo e executa o build. |
+| `./build-lupi.sh --select`                   | Força a abertura do seletor interativo.          |
+| `./build-lupi.sh --cfg seletor=liga`         | Ativa o seletor e continua o build.              |
+| `./build-lupi.sh --cfg seletor=desliga`      | Desativa o seletor e continua o build.           |
+| `./build-lupi.sh --cfg-only seletor=liga`    | Ativa o seletor e encerra sem compilar.          |
+| `./build-lupi.sh --cfg-only seletor=desliga` | Desativa o seletor e encerra sem compilar.       |
+| `./build-lupi.sh --help`                     | Exibe a ajuda.                                   |
+Também são aceitos os atalhos:
+- `-s` para `--select`.
+- `-h` para `--help`.
+### Valores de configuração aceitos
 
----
-## 🎯 Trabalhando com um Jogo Próprio
-### Início rápido
-1. Coloque os arquivos do seu jogo em `lupinho-sdk/src/` (deve ter `main.lua`, `game.lua` ou `lupi.yaml`)
-2. Crie `lupinho-sdk/src/lupi.yaml`:
-```yaml 
-name: Meu Jogo
-public: false
-version: 1.0
-```
-3. Rode `./build-lupi.sh`
-4. O resultado será `meu-jogo.lupi` na raiz
-### Trocar para um demo
-Para instalar o demo DEV (Debug Lab) ou GAME (Caio-Pernocas), o `src/` precisa estar "limpo" (sem `main.lua`/`game.lua`/`lupi.yaml`):
-```bash
-rm -rf lupinho-sdk/src/*
-echo "dev" > .lupi-mode   # ou "game"
-./build-lupi.sh
-```
-Na próxima execução, o script vai copiar o demo do cache `jogos-demo/` para `src/`.
-### Trocar de demo (DEBUG ↔ GAME)
-```bash
-# Remove marcador e conteúdo
-rm -rf lupinho-sdk/src/*
-echo "game" > .lupi-mode
-./build-lupi.sh
-```
-Se `jogos-demo/caio-pernocas/` já existir no cache, é copiado direto, sem novo clone.
+| Ativar | Desativar |
+| ------ | --------- |
+| `liga` | `desliga` |
+| `on`   | `off`     |
+| `true` | `false`   |
+| `1`    | `0`       |
+### Diferença entre `--cfg` e `--cfg-only`
 
----
-## 📦 Cache de Demos (`jogos-demo/`)
-Os demos clonados ficam em `jogos-demo/` (fora do `lupinho-sdk/src/`). Isso permite:
-- Manter múltiplos demos no cache
-- Trocar entre eles sem clonar de novo
-- Preservar jogos do usuário sem sobrescrever
-### Atualizar um demo
+**`--cfg`**
+Altera a configuração e continua a execução normal do script.
 ```bash
-rm -rf jogos-demo/lupinho-debug-lab
-./build-lupi.sh
+./build-lupi.sh --cfg seletor=liga
 ```
-### Limpar todo o cache
+
+**`--cfg-only`**
+Altera a configuração e encerra sem executar o processo de compilação.
 ```bash
-rm -rf jogos-demo/
+./build-lupi.sh --cfg-only seletor=desliga
 ```
-Adicione `jogos-demo/` ao `.gitignore` do seu projeto.
+
+> **Atenção:** os comandos de configuração exigem que `.lupi-select` já exista. Na primeira execução, rode o script normalmente para inicializar o ambiente.
 
 ---
-## 🔀 Trocar de Modo (DEV ↔ GAME)
-O modo fica gravado em `.lupi-mode`:
-```bash
-cat .lupi-mode    # mostra "dev" ou "game"
-```
-Para trocar:
-```bash
-# Exemplo: migrar de GAME para DEV
-echo "dev" > .lupi-mode
-rm -rf lupinho-sdk/src/*       # remove o Caio-Pernocas
-rm -rf lupinho/site/dist       # força recompilar (opcional)
-./build-lupi.sh
-```
-O script vai detectar o novo modo e instalar o demo correspondente, perguntar sobre o Furnace, e recompilar com `make debug`.
+## ⚙️ Configuração: `.lupi-select`
+O arquivo `.lupi-select`, localizado na raiz do projeto, armazena o jogo selecionado e o comportamento do seletor.
 
----
-## 🔄 Atualizar Dependências
-O script faz `git fetch` + `git pull` automaticamente quando há commits novos.
-Para forçar a atualização de um repositório específico:
-```bash
-cd lupinho && git pull origin dev && cd ..
-cd lupinho-sdk && git pull origin main && cd ..
-cd lupi-codec && git pull origin upgrades && cd ..
-```
-Para recompilar após atualização:
-```bash
-rm -rf lupinho/site/dist
-./build-lupi.sh
-```
----
-## 🔧 Variáveis de Ambiente
-
-| Variável    | Descrição                           | Padrão                      |
-| ----------- | ----------------------------------- | --------------------------- |
-| `GAME_NAME` | Sobrescreve o nome do `.lupi` final | Detectado (ver seção acima) |
 Exemplo:
-```bash
-GAME_NAME=sonic-1-sms-nightly ./build-lupi.sh
+```ini
+jogo=caio-pernocas
+seletor=liga
 ```
+### Parâmetros
+
+**`jogo`**
+Identifica o projeto atualmente selecionado.
+Exemplos:
+- `caio-pernocas`
+- `lupinho-debug-lab`
+- `meu-jogo`
+
+**`seletor`**
+Controla o comportamento da seleção de projetos.
+- `liga`: apresenta o menu interativo durante as execuções.
+- `desliga`: preserva o conteúdo atual de `lupinho-sdk/src/` e utiliza o projeto existente.
+### Migração automática
+O script oferece compatibilidade com configurações antigas.
+
+São reconhecidos:
+- O arquivo `.lupi-mode`, que utilizava os valores `dev`, `game` e `user`.
+- A flag `making_game=1` presente nos antigos marcadores de instalação.
+
+A migração converte essas informações para o novo formato `.lupi-select`.
+
+Quando encontra `making_game=1`, o script interpreta essa configuração como `seletor=desliga` e remove a flag antiga.
+
 ---
-## 🐛 Troubleshooting
-### "Compilação abortada. O servidor não funcionará sem o Lupinho compilado."
-Você respondeu `n` à pergunta de compilação, mas `site/dist/` está vazio. Rode novamente e responda `s`.
-### "libfurengine.a ausente — se precisar recompilar o Lupinho, o 'make debug' pode falhar no link."
-Você escolheu clonar o Furnace sem compilar. Para resolver:
-```bash
-./build-lupi.sh
-# escolha 2) Clonar e compilar
+## 🎮 Modos de trabalho
+
+O script identifica três tipos de seleção de projetos.
+### 1. GAME — Caio-Pernocas
+
+<badge color="success">Web</badge>
+Utilizado pelo projeto `caio-pernocas`.
+
+- Executa a compilação padrão do Lupinho.
+- Utiliza `make web`, quando disponível.
+- Não exige a compilação do Furnace como parte do fluxo de build GAME.
+- Pode reutilizar um build DEV existente, caso os artefatos necessários estejam disponíveis.
+
+### 2. DEV — Lupinho Debug Lab
+
+<badge color="info">Debug</badge>
+
+Utilizado pelo projeto `lupinho-debug-lab`.
+
+- Executa a compilação Debug do Lupinho.
+- Utiliza `make debug`.
+- Gerencia a integração com Furnace.
+- Verifica a biblioteca `libfurengine.a`.
+- Verifica o objeto `fur_player-web.o`.
+- Detecta artefatos desatualizados.
+- Verifica a compatibilidade do cache CMake com o Emscripten atual.
+### 3. USER — Projetos personalizados
+
+Utilizado para qualquer outro projeto selecionado dentro de `jogos-demo/`.
+O modo USER identifica o nome do projeto e utiliza seus arquivos no SDK.
+
+Ele não representa um terceiro tipo de compilação independente: o script continua utilizando as regras de build e compatibilidade do Lupinho.
+
+---
+## 🎛️ Seletor de jogos
+O seletor permite alternar entre os projetos disponíveis.
+
+Na execução interativa, são apresentadas três opções principais:
+```text
+Qual jogo deseja compilar?
+
+  1) Caio-Pernocas     (build web   — sem furnace)
+  2) Lupinho Debug Lab (build debug — com furnace)
+  3) Outro (pasta em jogos-demo/)
 ```
-### "Erro: A compilação do Lupinho falhou (game.wasm/game.html/game.js ainda ausentes)."
-Verifique os logs do `make` acima. Causas comuns:
-- `emsdk` não está no `PATH` → `source ~/emsdk/emsdk_env.sh`
-- `libfurengine.a` ausente → recompile o Furnace
-- Ferramentas do sistema faltando (`cmake`, `ninja`)
-### "Outro demo já está em ... Preservando."
-Você tentou instalar DEV mas o GAME já está em `src/`. Para forçar a troca:
+A terceira opção permite selecionar qualquer outra pasta existente em `jogos-demo/`.
+### Seleção direta
+Também é possível selecionar um projeto pelo terminal:
+```bash
+./build-lupi.sh meu-jogo
+```
+O nome deve corresponder a uma pasta existente em `jogos-demo/`.
+Utilize `--cfg seletor=liga` para voltar a permitir a seleção normal.
+### Forçar o seletor
+Mesmo com o seletor desativado:
+```bash
+./build-lupi.sh --select
+```
+
+O menu será apresentado, mas a configuração permanente não será alterada.
+
+---
+## 🧑‍💻 Modo de desenvolvimento contínuo
+Quando estiver desenvolvendo um jogo próprio, é recomendável utilizar:
+```bash
+./build-lupi.sh --cfg-only seletor=desliga
+```
+
+Nesse modo:
+- O script não apresenta o seletor automaticamente.
+- O conteúdo de `lupinho-sdk/src/` é preservado.
+- Não substitui o projeto atual por uma demonstração.
+- Verifica alterações no código-fonte.
+- Cria backups automáticos quando detecta alterações desde o último backup.
+
+Isso permite executar repetidamente o script durante o desenvolvimento sem precisar selecionar novamente o jogo.
+
+Para voltar ao modo interativo:
 ```
 bash
-rm -rf lupinho-sdk/src/*
-echo "dev" > .lupi-mode
-./build-lupi.sh
+./build-lupi.sh --cfg-only seletor=liga
 ```
-### Erro de permissão em `.git/objects/pack/*`
-Resquício de versões antigas do script. Limpe o cache:
-```bash
-rm -rf jogos-demo/
-./build-lupi.sh
-```
-### Nome do `.lupi` saiu errado (ex.: `teste.lupi`)
-Falta `lupi.yaml` em `lupinho-sdk/src/` ou `GAME_NAME` não foi exportado. Crie o `lupi.yaml` ou rode:
-```
-bash
-GAME_NAME=meu-jogo ./build-lupi.sh
-```
+
 ---
-## 📝 Notas
-- O script **nunca** sobrescreve `lupinho-sdk/src/` se detectar `main.lua`, `game.lua` ou `lupi.yaml` (a menos que você peça explicitamente via `rm -rf`).
-- O cache `jogos-demo/` **não** é removido automaticamente — você controla quando limpar.
-- Releases antigos em `lupi-codec/jogo-release/releases/` **não** são removidos (o `lupi-codec` mantém histórico por timestamp).
-- O `.lupi` final fica sempre na raiz, com nome detectado (não sobrescreve o `jogo.lupi` interno do codec).
+## 💾 Sistema de backup inteligente
+
+O sistema de backup protege os projetos durante a troca de jogos e durante o desenvolvimento.
+Os backups são organizados individualmente por projeto:
+```text
+bkp_jogos/
+├── caio-pernocas/
+│   ├── caio-pernocas-backup-20261110-101234.zip
+│   └── caio-pernocas-backup-20261110-111234.zip
+│
+├── lupinho-debug-lab/
+│   └── lupinho-debug-lab-backup-20261110-121234.zip
+│
+└── meu-jogo/
+    └── meu-jogo-backup-20261110-131234.zip
+```
+### Quando os backups são criados?
+O script realiza backups em diferentes situações:
+
+1 - **Troca de jogo**
+	Antes de substituir o conteúdo atual de `lupinho-sdk/src/`, o projeto anterior pode ser armazenado em um arquivo ZIP.
+
+2 - **Projeto personalizado**
+	Quando existe um jogo próprio no diretório `src/`, o script pode solicitar confirmação antes de substituí-lo.
+
+3 - **Alterações durante o desenvolvimento**
+
+Quando o seletor está desativado, o script calcula o hash SHA-256 do conteúdo de `src/` e compara com o último hash armazenado.
+Se detectar alterações, cria automaticamente um backup antes de continuar.
+### Características
+- Até 8 backups por jogo.
+- Rotação independente para cada projeto.
+- Exclusão automática dos backups mais antigos.
+- Nomes com data e horário.
+- Identificação do nome do jogo pelo `lupi.yaml`, quando disponível.
+- Exclusão de arquivos internos do Git e marcadores de instalação.
+- Migração automática dos backups antigos.
+### Detecção de alterações
+O arquivo `.last-src-hash` armazena o hash do conteúdo de `lupinho-sdk/src/` registrado no último backup.
+
+O cálculo considera os arquivos e seus conteúdos, permitindo detectar modificações mesmo quando não existe alteração no histórico Git.
+
+> **Importante:** o backup é uma proteção adicional. Recomenda-se manter também o controle de versão dos projetos com Git.
+---
+## 🎵 Integração com Furnace
+
+O Furnace é utilizado na integração de áudio do Lupinho.
+No modo DEV, o script verifica se o ambiente está preparado e oferece opções para instalar e compilar os componentes necessários.
+### Artefatos verificados
+
+| Arquivo            | Finalidade                         |
+| ------------------ | ---------------------------------- |
+| `libfurengine.a`   | Biblioteca compilada do Furnace    |
+| `fur_player-web.o` | Objeto do player de áudio para Web |
+| `CMakeCache.txt`   | Configuração do build do Furnace   |
+### Processo de preparação
+Quando necessário, o script permite:
+1. Clonar o repositório Furnace.
+2. Inicializar seus submódulos Git.
+3. Configurar o link simbólico dentro do Lupinho.
+4. Compilar a biblioteca do Furnace.
+5. Compilar o objeto `fur_player-web.o`.
+
+O script também verifica se o código-fonte `fur_player.cpp` foi modificado depois da geração do objeto.
+
+Isso evita reutilizar um artefato desatualizado.
+
+---
+## 🏗️ Sistema de compilação inteligente
+
+Antes de iniciar uma compilação, o script verifica os arquivos existentes em `lupinho/site/dist/`.
+
+Os arquivos principais esperados são:
+```text
+site/dist/
+├── game.wasm
+├── game.html
+├── game.js
+└── .build-mode
+```
+
+O arquivo `.build-mode` registra o modo utilizado na geração do build.
+### Reaproveitamento de builds
+O script tenta evitar recompilações desnecessárias.
+
+| Transição   | Comportamento                                        |
+| ----------- | ---------------------------------------------------- |
+| GAME → GAME | Reutiliza se o build estiver válido                  |
+| DEV → DEV   | Reutiliza se os artefatos estiverem válidos          |
+| GAME → DEV  | Recompila quando o build GAME não atende ao modo DEV |
+| DEV → GAME  | Pode reutilizar o build DEV existente                |
+A reutilização depende da presença dos arquivos necessários e da consistência dos artefatos.
+
+### Particularidade da integração com Furnace
+
+No modo DEV, o script também verifica a biblioteca e o objeto do Furnace.
+
+No modo GAME, a ausência de `fur_player-web.o` pode gerar um aviso. Caso o ambiente tenha sido instalado do zero, pode ser necessário executar uma compilação DEV primeiro para gerar esse objeto.
+
+---
+## 🚀 Fluxo de compilação
+
+O processo principal está dividido em oito etapas.
+
+|Etapa|Operação|
+|---|---|
+|0|Verificação das dependências do sistema|
+|1|Sincronização dos repositórios e preparação do jogo|
+|2|Limpeza do diretório de trabalho do codec|
+|3|Cópia dos arquivos do SDK|
+|4|Geração do release pelo `lupi-codec`|
+|5|Localização do release gerado|
+|6|Compactação dos arquivos|
+|7|Geração do pacote final `.lupi`|
+|8|Inicialização do servidor HTTP|
+### Ordem de compilação no modo DEV
+
+A preparação dos componentes de áudio segue esta sequência:
+
+1. **Furnace:** gera a biblioteca `libfurengine.a`.
+2. **Fur Player:** compila `fur_player-web.o`.
+3. **Lupinho:** gera o WebAssembly utilizando `make debug`.
+
+No modo GAME, o script utiliza a compilação Web padrão.
+
+### Geração do arquivo `.lupi`
+
+Depois da compilação do Lupinho, o script utiliza o `lupi-codec`:
+```bash
+lua run.lua jogo/ jogo-release/
+```
+
+O release gerado é compactado em formato ZIP e renomeado para:
+```text
+<nome-do-jogo>.lupi
+```
+
+O arquivo final fica na raiz do diretório onde o script está localizado.
+
+---
+## 🌐 Execução local
+
+Após gerar o pacote `.lupi`, o script inicia automaticamente um servidor HTTP:
+```bash
+python3 -m http.server 8080
+```
+
+O servidor utiliza o diretório:
+```text
+lupinho/site/
+```
+
+Acesse pelo navegador:
+**http://localhost:8080**
+Para encerrar o servidor:
+```text
+Ctrl + C
+```
+
+---
+## 📁 Estrutura de diretórios
+A estrutura abaixo representa a organização esperada dos arquivos e repositórios após a preparação do ambiente.
+```text
+build-lupi/
+│
+├── build-lupi.sh
+│
+├── build-lupi/                 # Repositório do script
+│
+├── .lupi-select                # Configuração do seletor
+├── .last-src-hash              # Hash do último backup
+├── .emsdk-path                 # Caminho salvo do Emscripten
+│
+├── bkp_jogos/                  # Backups organizados por jogo
+│   ├── caio-pernocas/
+│   └── meu-jogo/
+│
+├── jogos-demo/                 # Cache dos projetos de demonstração
+│   ├── caio-pernocas/
+│   └── lupinho-debug-lab/
+│
+├── lupinho/                    # Simulador Lupinho
+│   ├── src/
+│   │   ├── music/
+│   │   └── libs/web/
+│   └── site/
+│       └── dist/
+│
+├── lupinho-sdk/                # SDK de desenvolvimento
+│   └── src/                    # Projeto atualmente selecionado
+│
+├── lupi-codec/                 # Ferramenta de empacotamento
+│   ├── jogo/
+│   └── jogo-release/
+│       └── releases/
+│
+├── furnace/                    # Repositório Furnace
+├── wav2vgm/                    # Conversor WAV para VGM
+├── vgm2fur/                    # Conversor VGM para Furnace
+│
+├── emsdk/                      # Emscripten SDK (se instalado aqui)
+│
+└── meu-jogo.lupi               # Release final
+```
+
+Os diretórios `build-lupi/`, `emsdk/` e os arquivos auxiliares podem variar conforme a instalação e a localização do script.
+
+O repositório `build-lupi` é sincronizado automaticamente quando o script não está sendo executado de dentro dele próprio.
+
+---
+## 🔄 Repositórios sincronizados
+
+O ambiente utiliza os seguintes repositórios:
+
+|Projeto|Repositório|Branch|
+|---|---|---|
+|Build Lupi|Hirikko/build-lupi|`main`|
+|Lupinho|Hirikko/lupinho|`dev`|
+|Lupinho SDK|[lupi-org-br/lupinho-sdk](https://github.com/lupi-org-br/lupinho-sdk)|Padrão|
+|Lupi Codec|Hirikko/lupi-codec|`upgrades`|
+|Furnace|Hirikko/furnace|`cli`|
+|WAV2VGM|Hirikko/WAV2VGM|`cli`|
+|vgm2fur|Hirikko/vgm2fur|`cli`|
+|Emscripten SDK|emscripten-core/emsdk|`latest`|
+
+Os projetos de demonstração também são sincronizados automaticamente:
+- Caio-Pernocas
+- [Lupinho Debug Lab](https://github.com/Hirikko/Lupinho-Debug-Lab)
+### Estratégia de sincronização
+O script verifica a branch atual, consulta o repositório remoto e tenta atualizar os projetos sem descartar alterações locais automaticamente.
+
+Os jogos de demonstração possuem um processo específico de sincronização, que pode utilizar `stash` e `reset --hard` para restaurar o conteúdo remoto quando a atualização convencional falha.
+
+> **Atenção:** modificações locais nos caches dos jogos de demonstração podem ser descartadas durante a sincronização. Não utilize esses diretórios como único local de armazenamento dos seus projetos.
+
+---
+## 🛠️ Solução de problemas
+
+### Nenhum jogo selecionado
+
+Verifique se o arquivo `.lupi-select` está correto.
+
+Caso esteja corrompido, remova-o:
+```bash
+rm -f .lupi-select
+```
+
+Execute novamente:
+```bash
+./build-lupi.sh
+```
+
+O seletor será inicializado novamente.
+### Emscripten não encontrado
+Verifique se o Emscripten está instalado e se o ambiente foi carregado.
+
+O script procura o SDK nos seguintes locais:
+- Caminho definido pela variável `EMSDK_DIR`.
+- Caminho salvo em `.emsdk-path`.
+- Diretório `emsdk/` do projeto.
+- Diretório `~/emsdk`.
+
+Caso não encontre uma instalação válida, oferece a instalação do SDK.
+### `fur_player-web.o` ausente no modo GAME
+O objeto pode não existir em uma instalação nova.
+
+Execute uma vez o build em modo DEV para preparar os componentes necessários do Furnace.
+Depois, retorne ao projeto GAME.
+### Furnace não compila
+Verifique:
+- Se os submódulos Git foram inicializados.
+- Se o Emscripten está disponível.
+- Se CMake e Ninja estão instalados.
+- Se os artefatos antigos foram removidos quando necessário.
+### Conflitos na sincronização Git
+Se um repositório não conseguir atualizar, entre na pasta correspondente:
+```bash
+cd lupinho
+```
+
+Verifique as modificações:
+
+```bash
+git status
+```
+Resolva os conflitos ou preserve suas alterações antes de atualizar novamente.
+**Atenção:** `git reset --hard` descarta modificações locais. Utilize somente quando tiver certeza de que não precisa preservá-las.
+### Porta 8080 ocupada
+O servidor utiliza a porta 8080 fixa.
+Verifique se outro processo está utilizando essa porta e encerre-o antes de executar novamente.
+
+---
+
+## 🔗 Links úteis
+
+### Ecossistema Lupi
+- [Documentação oficial do Lupi](https://lupi.api.br/docs/index.html)
+- [Lupinho — Fork de desenvolvimento](https://github.com/Hirikko/lupinho/tree/dev)
+- [Lupinho oficial](https://github.com/lupi-org-br/lupinho)
+- [Lupinho SDK](https://github.com/lupi-org-br/lupinho-sdk)
+- [Lupi Codec — Fork upgrades](https://github.com/Hirikko/lupi-codec/tree/upgrades)
+### Ferramentas e componentes
+- [Furnace — Fork CLI](https://github.com/Hirikko/furnace/tree/cli)
+- WAV2VGM
+- vgm2fur
+- Emscripten SDK
+### Projetos de demonstração
+- Caio-Pernocas
+- [Lupinho Debug Lab](https://github.com/Hirikko/Lupinho-Debug-Lab)
+
+---
+## 📄 Licença
+Consulte o arquivo `LICENSE` deste repositório para conhecer os termos de utilização, modificação e distribuição.
+
+---
+**Build Lupi** — Um único script para preparar o ambiente, selecionar projetos, compilar e empacotar jogos do ecossistema Lupi.
+
 ---
 ## 🔗 Links Úteis
 - [Lupinho (fork dev)](https://github.com/Hirikko/lupinho/tree/dev)
