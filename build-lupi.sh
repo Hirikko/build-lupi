@@ -1,14 +1,18 @@
+
 #!/usr/bin/env bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR"
+SELECT_FILE="$BUILD_DIR/.lupi-select"
 MODE_FILE="$BUILD_DIR/.lupi-mode"
+SRC_HASH_FILE="$BUILD_DIR/.last-src-hash"
 DEMOS_DIR="$BUILD_DIR/jogos-demo"
+BACKUP_DIR="$BUILD_DIR/bkp_jogos"
 EMSDK_PATH_FILE="$BUILD_DIR/.emsdk-path"
 EMSDK_DIR="${EMSDK_DIR:-}"
 
-# Repositórios externos (todos no topo, sem .git aninhado)
+# Repositórios externos
 LUPINHO_DIR="$BUILD_DIR/lupinho"
 FURNACE_DIR="$BUILD_DIR/furnace"
 SDK_DIR="$BUILD_DIR/lupinho-sdk"
@@ -16,6 +20,8 @@ SDK_SRC="$SDK_DIR/src"
 CODEC_DIR="$BUILD_DIR/lupi-codec"
 WAV2VGM_DIR="$BUILD_DIR/wav2vgm"
 VGM2FUR_DIR="$BUILD_DIR/vgm2fur"
+BUILD_LUPI_DIR="$BUILD_DIR/build-lupi"
+BUILD_LUPI_URL="https://github.com/Hirikko/build-lupi.git"
 
 RELEASE_DIR="$CODEC_DIR/jogo-release"
 RELEASES_DIR="$RELEASE_DIR/releases"
@@ -25,14 +31,68 @@ LUPINHO_SITE="$LUPINHO_DIR/site"
 
 MODE=""
 GAME_NAME="${GAME_NAME:-}"
+GAME_SELECTION=""
+CLI_GAME=""
+FORCE_SELECT=0
+CFG_OP=""
+CFG_ONLY=0
 
-# --- Helpers de log ---
 step() {
     echo ""
     echo "================================================="
     echo "$@"
     echo "================================================="
 }
+
+# --- Parse args ---
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --select|-s) FORCE_SELECT=1; shift ;;
+        --help|-h)
+            cat <<EOF
+Uso: $0 [<nome-do-jogo>] [--select] [--cfg <chave>=<valor>] [--cfg-only <chave>=<valor>]
+
+Argumentos posicionais:
+  <nome-do-jogo>   Seleção rápida (ignorado se seletor=desliga).
+
+Flags:
+  --select, -s         Força o seletor interativo (mesmo com seletor=desliga)
+  --cfg <op>           Altera configuração e CONTINUA o build.
+  --cfg-only <op>      Altera configuração e SAI (sem build).
+                       Opções: seletor=liga | seletor=desliga
+  --help, -h           Mostra esta ajuda
+EOF
+            exit 0
+            ;;
+        --cfg)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Erro: --cfg precisa de argumento (ex: --cfg seletor=liga)"
+                exit 1
+            fi
+            CFG_OP="$1"
+            shift
+            ;;
+        --cfg-only)
+            shift
+            if [ $# -eq 0 ]; then
+                echo "Erro: --cfg-only precisa de argumento (ex: --cfg-only seletor=liga)"
+                exit 1
+            fi
+            CFG_OP="$1"
+            CFG_ONLY=1
+            shift
+            ;;
+        -*)
+            echo "Opção desconhecida: $1"
+            exit 1
+            ;;
+        *)
+            CLI_GAME="$1"
+            shift
+            ;;
+    esac
+done
 
 # --- SO ---
 detect_os() {
@@ -64,6 +124,96 @@ install_packages() {
     esac
 }
 
+# --- .lupi-select helpers (formato: jogo=<nome>\nseletor=liga|desliga) ---
+select_migrate() {
+    [ ! -f "$SELECT_FILE" ] && return 0
+    if grep -qE '^jogo=' "$SELECT_FILE" 2>/dev/null; then
+        return 0
+    fi
+    local old
+    old=$(head -n1 "$SELECT_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ -z "$old" ] && return 0
+    local sel="liga"
+    if [ -f "$SDK_SRC/.${old}-installed" ] && grep -qE '^making_game=1$' "$SDK_SRC/.${old}-installed" 2>/dev/null; then
+        sel="desliga"
+        sed -i '/^making_game=1$/d' "$SDK_SRC/.${old}-installed" 2>/dev/null || true
+    fi
+    printf "jogo=%s\nseletor=%s\n" "$old" "$sel" > "$SELECT_FILE"
+    echo "  Migração .lupi-select: jogo=$old, seletor=$sel"
+}
+
+select_get_jogo() {
+    if [ -f "$SELECT_FILE" ] && grep -qE '^jogo=' "$SELECT_FILE" 2>/dev/null; then
+        grep -E '^jogo=' "$SELECT_FILE" | head -n1 | cut -d= -f2- | tr -d '[:space:]'
+    elif [ -f "$SELECT_FILE" ]; then
+        head -n1 "$SELECT_FILE" 2>/dev/null | tr -d '[:space:]'
+    else
+        echo ""
+    fi
+}
+
+select_get_seletor() {
+    if [ -f "$SELECT_FILE" ]; then
+        local v
+        v=$(grep -E '^seletor=' "$SELECT_FILE" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '[:space:]')
+        [ -n "$v" ] && { echo "$v"; return; }
+    fi
+    echo "liga"
+}
+
+select_set_jogo() {
+    local jogo="$1"
+    local sel
+    sel=$(select_get_seletor)
+    printf "jogo=%s\nseletor=%s\n" "$jogo" "$sel" > "$SELECT_FILE"
+}
+
+select_set_seletor() {
+    local sel="$1"
+    local jogo
+    jogo=$(select_get_jogo)
+    printf "jogo=%s\nseletor=%s\n" "$jogo" "$sel" > "$SELECT_FILE"
+}
+
+# --- Processa --cfg ---
+process_cfg_op() {
+    local op="$1"
+    local only="${2:-0}"
+
+    select_migrate
+    if [ ! -f "$SELECT_FILE" ]; then
+        echo "Erro: .lupi-select não existe. Rode ./build-lupi.sh uma vez primeiro."
+        exit 1
+    fi
+    case "$op" in
+        seletor=*)
+            local val="${op#seletor=}"
+            case "$val" in
+                liga|on|true|1)      val="liga" ;;
+                desliga|off|false|0) val="desliga" ;;
+                *) echo "Valor inválido: '$val' (use liga ou desliga)"; exit 1 ;;
+            esac
+            select_set_seletor "$val"
+            echo "  Configurado: seletor=$val"
+            if [ "$only" -eq 1 ]; then
+                echo "  (--cfg-only: build não executado)"
+                exit 0
+            fi
+            echo "  Continuando com o build..."
+            echo ""
+            ;;
+        *)
+            echo "Opção --cfg desconhecida: $op"
+            echo "Opções: seletor=liga, seletor=desliga"
+            exit 1
+            ;;
+    esac
+}
+
+if [ -n "$CFG_OP" ]; then
+    process_cfg_op "$CFG_OP" "$CFG_ONLY"
+fi
+
 # --- Emscripten ---
 persist_emsdk_to_rc() {
     local emsdk_path=$1
@@ -72,7 +222,6 @@ persist_emsdk_to_rc() {
     for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
         [ ! -f "$rc" ] && continue
         if grep -qF "$block_start" "$rc" 2>/dev/null; then
-            echo "  $rc: bloco emsdk já presente."
             continue
         fi
         {
@@ -145,13 +294,10 @@ install_emscripten() {
     source ./emsdk_env.sh > /dev/null 2>&1
     set -e
     cd "$SCRIPT_DIR"
-    command -v emcc &>/dev/null || { echo "Erro: emcc indisponível. Rode: source $EMSDK_DIR/emsdk_env.sh"; exit 1; }
+    command -v emcc &>/dev/null || { echo "Erro: emcc indisponível."; exit 1; }
     echo "Emscripten instalado: $(emcc --version | head -n1)"
-
     step " Configurando ~/.bashrc e ~/.zshrc"
     persist_emsdk_to_rc "$EMSDK_DIR"
-    echo "Local: $EMSDK_DIR"
-    echo "Para usar em outros terminais: source ~/.zshrc (ou ~/.bashrc)"
 }
 
 check_system_dependencies() {
@@ -175,7 +321,7 @@ check_system_dependencies() {
         fi
     done
     command -v lua &>/dev/null || {
-        if [ "$OS" = "linux" ]; then missing+=("lua5.3" "liblua5.3-dev")
+        if [ "$OS" = "linux" ]; then missing+=("lua5.5" "liblua5.5-dev")
         else missing+=("lua")
         fi
     }
@@ -190,7 +336,7 @@ check_system_dependencies() {
     fi
 }
 
-# --- Hash de commit de um repo ---
+# --- Helpers git ---
 get_repo_hash() {
     local dir=$1
     if [ -d "$dir/.git" ]; then
@@ -200,7 +346,38 @@ get_repo_hash() {
     fi
 }
 
-# --- git sync robusto ---
+get_src_content_hash() {
+    if [ ! -d "$SDK_SRC" ]; then
+        echo ""
+        return
+    fi
+    (
+        cd "$SDK_SRC"
+        find . -mindepth 1 -type f \
+            -not -path "./.git/*" -not -name ".git" \
+            -not -name ".*-installed" \
+            -print0 2>/dev/null \
+        | sort -z \
+        | xargs -0 -r sha256sum 2>/dev/null \
+        | sha256sum 2>/dev/null \
+        | cut -d' ' -f1
+    )
+}
+
+src_content_changed_since_backup() {
+    local current_hash
+    current_hash=$(get_src_content_hash)
+    [ -z "$current_hash" ] && return 1
+
+    if [ ! -f "$SRC_HASH_FILE" ]; then
+        return 0
+    fi
+
+    local stored_hash
+    stored_hash=$(cat "$SRC_HASH_FILE" 2>/dev/null | tr -d '[:space:]')
+    [ "$current_hash" != "$stored_hash" ]
+}
+
 git_sync_dir() {
     local dir=$1 url=$2 branch=${3:-""}
 
@@ -251,12 +428,7 @@ git_sync_dir() {
     local_hash=$(git rev-parse HEAD)
     remote_hash=$(git rev-parse "origin/$current_branch" 2>/dev/null || echo "")
 
-    if [ -z "$remote_hash" ]; then
-        cd "$old_pwd"
-        return 0
-    fi
-
-    if [ "$local_hash" = "$remote_hash" ]; then
+    if [ -z "$remote_hash" ] || [ "$local_hash" = "$remote_hash" ]; then
         cd "$old_pwd"
         return 0
     fi
@@ -272,7 +444,6 @@ git_sync_dir() {
     return 0
 }
 
-# --- Furnace ---
 setup_furnace_symlink() {
     local target="$LUPINHO_DIR/src/furnace"
     [ ! -d "$LUPINHO_DIR" ] && return 0
@@ -304,7 +475,27 @@ install_furnace() {
 install_wav2vgm() { git_sync_dir "$WAV2VGM_DIR" "https://github.com/Hirikko/WAV2VGM.git" "cli"; }
 install_vgm2fur() { git_sync_dir "$VGM2FUR_DIR" "https://github.com/Hirikko/vgm2fur.git" "cli"; }
 
-# --- Demos em jogos-demo/ (cache) ---
+# --- Sincronização do repositório build-lupi ---
+install_build_lupi() {
+    # Se o script já está rodando de dentro da própria pasta build-lupi,
+    # não tenta clonar dentro de si mesmo (evita loop).
+    local script_real
+    script_real=$(cd "$SCRIPT_DIR" && pwd -P)
+    local target_real
+    if [ -d "$BUILD_LUPI_DIR" ]; then
+        target_real=$(cd "$BUILD_LUPI_DIR" && pwd -P)
+    else
+        target_real=""
+    fi
+
+    if [ "$script_real" = "$target_real" ]; then
+        echo "  build-lupi: rodando de dentro da pasta, pulando sincronização."
+        return 0
+    fi
+
+    git_sync_dir "$BUILD_LUPI_DIR" "$BUILD_LUPI_URL" "main"
+}
+
 force_sync_demo() {
     local demo_name=$1
     local url=$2
@@ -338,7 +529,6 @@ force_sync_demo() {
         return
     fi
 
-    # Verifica se o working tree tem arquivos (além do .git)
     local file_count
     file_count=$(find . -mindepth 1 -maxdepth 1 -not -name ".git" | wc -l)
 
@@ -349,33 +539,21 @@ force_sync_demo() {
     fi
 
     if [ "$local_hash" = "$remote_hash" ] && [ "$file_count" -eq 0 ]; then
-        echo "  $demo_name: working tree vazio, restaurando arquivos..."
+        echo "  $demo_name: working tree vazio, restaurando..."
         git reset --hard HEAD --quiet 2>/dev/null || true
         git checkout . --quiet 2>/dev/null || true
-        file_count=$(find . -mindepth 1 -maxdepth 1 -not -name ".git" | wc -l)
-        if [ "$file_count" -gt 0 ]; then
-            echo "  $demo_name: restaurado com $file_count item(ns)."
-        else
-            echo "  Aviso: $demo_name continua vazio após restauração."
-        fi
         cd - >/dev/null
         return
     fi
 
-    # Hash difere → pull normal
     local status_line
     status_line=$(git status -sb 2>/dev/null | head -1)
-
     echo "  $demo_name: desatualizado. Status: $status_line"
-    echo "  Fazendo pull de origin/$current_branch..."
 
     if ! git pull origin "$current_branch" --quiet 2>&1; then
-        echo "  Aviso: pull falhou. Tentando stash + reset --hard..."
         git stash --include-untracked --quiet 2>/dev/null || true
         if git reset --hard "origin/$current_branch" --quiet 2>/dev/null; then
             echo "  $demo_name resetado para $(git rev-parse --short HEAD)."
-        else
-            echo "  Aviso: reset --hard também falhou em $demo_name."
         fi
     else
         echo "  $demo_name atualizado para $(git rev-parse --short HEAD)."
@@ -389,16 +567,53 @@ sync_demo_caches() {
     force_sync_demo "lupinho-debug-lab" "https://github.com/Hirikko/Lupinho-Debug-Lab.git"
 }
 
+# --- Backups (por jogo, cada um com até MAX_BACKUPS) ---
+MAX_BACKUPS=9
+
+migrate_flat_backups() {
+    [ ! -d "$BACKUP_DIR" ] && return 0
+    local flat_count
+    flat_count=$(find "$BACKUP_DIR" -maxdepth 1 -name "*.zip" -type f 2>/dev/null | wc -l)
+    [ "$flat_count" -eq 0 ] && return 0
+
+    echo "  Migrando $flat_count backup(s) antigos para subpastas por jogo..."
+    for zip in "$BACKUP_DIR"/*.zip; do
+        [ -f "$zip" ] || continue
+        local fname game
+        fname=$(basename "$zip")
+        game=$(echo "$fname" | sed -E 's/-backup-[0-9]{8}-[0-9]{6}\.zip$//')
+        if [ -n "$game" ] && [ "$game" != "$fname" ]; then
+            mkdir -p "$BACKUP_DIR/$game"
+            mv -f "$zip" "$BACKUP_DIR/$game/"
+            echo "    $fname → bkp_jogos/$game/"
+        fi
+    done
+}
+
+cleanup_old_backups() {
+    local game_label="$1"
+    local game_dir="$BACKUP_DIR/$game_label"
+    [ ! -d "$game_dir" ] && return 0
+    local count
+    count=$(find "$game_dir" -maxdepth 1 -name "*.zip" -type f 2>/dev/null | wc -l)
+    while [ "$count" -ge "$MAX_BACKUPS" ]; do
+        local oldest
+        oldest=$(find "$game_dir" -maxdepth 1 -name "*.zip" -type f -printf "%T@ %p\n" 2>/dev/null | sort -n | head -n1 | cut -d' ' -f2-)
+        [ -z "$oldest" ] && break
+        echo "  Removendo backup antigo: $(basename "$oldest")"
+        rm -f "$oldest"
+        count=$((count - 1))
+    done
+}
+
 backup_src() {
     local demo_name=$1
-    local src_has_content=0
+
+    local real_count=0
     if [ -d "$SDK_SRC" ]; then
-        # Conta arquivos que não são marcadores (.xx-installed)
-        local real_count
         real_count=$(find "$SDK_SRC" -mindepth 1 -maxdepth 1 -not -name ".*-installed" -not -name ".git" 2>/dev/null | wc -l)
-        [ "$real_count" -gt 0 ] && src_has_content=1
     fi
-    [ "$src_has_content" -eq 0 ] && return 0
+    [ "$real_count" -eq 0 ] && return 0
 
     local game_label="$demo_name"
     if [ -f "$SDK_SRC/lupi.yaml" ]; then
@@ -407,10 +622,14 @@ backup_src() {
         [ -n "$from_yaml" ] && game_label="$from_yaml"
     fi
 
-    local timestamp=$(date +%Y%m%d-%H%M%S)
-    local backup="$BUILD_DIR/${game_label}-backup-${timestamp}.zip"
+    local game_dir="$BACKUP_DIR/$game_label"
+    mkdir -p "$game_dir"
+    cleanup_old_backups "$game_label"
 
-    echo "  Fazendo backup do src/ atual em: $backup"
+    local timestamp=$(date +%Y%m%d-%H%M%S)
+    local backup="$game_dir/${game_label}-backup-${timestamp}.zip"
+
+    echo "  Fazendo backup do src/ em: $backup"
     cd "$SDK_SRC"
     if zip -qr "$backup" . -x '*.git/*' '*.git' '.*-installed' 2>/dev/null; then
         local size=$(stat -c%s "$backup" 2>/dev/null || stat -f%z "$backup" 2>/dev/null || echo "?")
@@ -419,122 +638,156 @@ backup_src() {
         echo "  Aviso: falha ao criar backup."
     fi
     cd "$SCRIPT_DIR"
+
+    get_src_content_hash > "$SRC_HASH_FILE"
 }
 
-install_demo_from_cache() {
+check_src_changes_on_every_run() {
+    local real_count=0
+    if [ -d "$SDK_SRC" ]; then
+        real_count=$(find "$SDK_SRC" -mindepth 1 -maxdepth 1 -not -name ".*-installed" -not -name ".git" 2>/dev/null | wc -l)
+    fi
+    [ "$real_count" -eq 0 ] && return 0
+
+    if ! src_content_changed_since_backup; then
+        return 0
+    fi
+
+    echo ""
+    echo "  Mudanças detectadas em lupinho-sdk/src/ desde o último backup."
+    backup_src "${GAME_SELECTION:-unknown}"
+}
+
+write_demo_marker() {
+    local marker=$1
+    local hash=$2
+    echo "$hash" > "$marker"
+}
+
+current_game_in_src() {
+    for m in "$SDK_SRC"/.*-installed; do
+        [ -f "$m" ] || continue
+        basename "$m" | sed -E 's/^\.(.+)-installed$/\1/'
+        return
+    done
+    if [ -f "$SDK_SRC/main.lua" ] || [ -f "$SDK_SRC/game.lua" ] || [ -f "$SDK_SRC/lupi.yaml" ]; then
+        echo "user-game"
+    fi
+}
+
+# --- Seletor ---
+list_demos() {
+    local demos=()
+    for d in "$DEMOS_DIR"/*/; do
+        [ ! -d "$d" ] && continue
+        local name
+        name=$(basename "$d")
+        [ "$name" = "caio-pernocas" ] && continue
+        [ "$name" = "lupinho-debug-lab" ] && continue
+        demos+=("$name")
+    done
+    printf "%s\n" "${demos[@]}"
+}
+
+choose_game_selection() {
+    local current="(nenhum)"
+    if [ -f "$SDK_SRC/.caio-pernocas-installed" ]; then
+        current="Caio-Pernocas"
+    elif [ -f "$SDK_SRC/.lupinho-debug-lab-installed" ]; then
+        current="Lupinho Debug Lab"
+    elif [ -f "$SDK_SRC/main.lua" ] || [ -f "$SDK_SRC/game.lua" ] || [ -f "$SDK_SRC/lupi.yaml" ]; then
+        current="Jogo do usuário ($(basename "$SCRIPT_DIR"))"
+    fi
+
+    step " Seletor de jogo"
+    echo "Jogo atual em src/: $current"
+    echo ""
+    echo "Qual jogo deseja compilar?"
+    echo "  1) Caio-Pernocas     (build web   — sem furnace)"
+    echo "  2) Lupinho Debug Lab (build debug — com furnace)"
+    echo "  3) Outro (pasta em jogos-demo/)"
+    echo ""
+
+    local extras
+    extras=$(list_demos)
+    if [ -n "$extras" ]; then
+        echo "Pastas adicionais em jogos-demo/:"
+        echo "$extras" | while read -r d; do
+            [ -n "$d" ] && echo "    - $d"
+        done
+        echo ""
+    fi
+
+    read -p "Escolha [1/2/3]: " _choice
+    local chosen=""
+    case "$_choice" in
+        1) chosen="caio-pernocas" ;;
+        2) chosen="lupinho-debug-lab" ;;
+        3)
+            read -p "Nome da pasta em jogos-demo/: " _custom
+            _custom=$(echo "$_custom" | tr -d '[:space:]')
+            if [ -z "$_custom" ] || [ ! -d "$DEMOS_DIR/$_custom" ]; then
+                echo "Erro: pasta '$DEMOS_DIR/$_custom' não existe."
+                exit 1
+            fi
+            chosen="$_custom"
+            ;;
+        *) echo "Opção inválida."; exit 1 ;;
+    esac
+    select_set_jogo "$chosen"
+    echo "  Seleção salva: $chosen"
+}
+
+swap_src_to_demo() {
     local demo_name=$1
     local demo_src="$DEMOS_DIR/$demo_name"
     local marker="$SDK_SRC/.${demo_name}-installed"
 
-    [ ! -d "$demo_src" ] && { echo "  Aviso: cache de $demo_name ausente."; return 1; }
+    [ ! -d "$demo_src" ] && { echo "  Erro: cache de $demo_name ausente."; return 1; }
 
     local cache_hash
     cache_hash=$(get_repo_hash "$demo_src")
 
     if [ -f "$marker" ]; then
         local stored_hash
-        stored_hash=$(cat "$marker" 2>/dev/null | tr -d '[:space:]' || echo "")
-        if [ -n "$cache_hash" ] && [ "$stored_hash" = "$cache_hash" ]; then
-            echo "  $demo_name já instalado em src/ (commit ${cache_hash:0:8})."
-            return 0
-        fi
-        if [ -z "$cache_hash" ] && [ -z "$stored_hash" ]; then
-            echo "  $demo_name já instalado em src/."
-            return 0
-        fi
-        echo "  $demo_name: cache mudou (${stored_hash:0:8} -> ${cache_hash:0:8})."
-    fi
-
-    local other_marker=""
-    if [ "$demo_name" = "caio-pernocas" ]; then
-        other_marker="$SDK_SRC/.lupinho-debug-lab-installed"
-    else
-        other_marker="$SDK_SRC/.caio-pernocas-installed"
-    fi
-    if [ -f "$other_marker" ]; then
-        echo "  Aviso: outro demo está instalado em src/. Preservando."
-        return 0
-    fi
-
-    # Jogo do usuário? Verifica se o cache mudou para perguntar
-    local user_game=0
-    if [ -f "$SDK_SRC/main.lua" ] || [ -f "$SDK_SRC/game.lua" ] || [ -f "$SDK_SRC/lupi.yaml" ]; then
-        user_game=1
-    fi
-
-    if [ "$user_game" -eq 1 ]; then
-        if [ -f "$marker" ] && [ -n "$cache_hash" ]; then
-            local stored_hash
-            stored_hash=$(cat "$marker" 2>/dev/null | tr -d '[:space:]' || echo "")
-            if [ -n "$stored_hash" ] && [ "$stored_hash" != "$cache_hash" ]; then
-                step " Conflito: $demo_name atualizado no cache, mas src/ tem jogo do usuário"
-                echo "  Cache:  ${stored_hash:0:8} -> ${cache_hash:0:8}"
-                echo "  src/:   jogo do usuário detectado"
-                echo ""
-                echo "O que deseja fazer?"
-                echo "  1) Preservar jogo do usuário (o .lupi gerado usa o jogo atual)"
-                echo "  2) Backup do jogo + reinstalar $demo_name atualizado"
-                echo "  3) Cancelar execução"
-                read -p "Escolha [1/2/3]: " ans
-                case "$ans" in
-                    2)
-                        backup_src "user-game"
-                        echo "  Limpando src/ para reinstalar $demo_name..."
-                        find "$SDK_SRC" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-                        rm -f "$marker"
-                        ;;
-                    3)
-                        echo "Abortando."
-                        exit 1
-                        ;;
-                    *)
-                        echo "  Preservando jogo do usuário."
-                        return 0
-                        ;;
-                esac
-            else
-                echo "  Jogo do usuário detectado em $SDK_SRC. Preservando."
-                return 0
+        stored_hash=$(head -n1 "$marker" 2>/dev/null | tr -d '[:space:]')
+        if [ "$stored_hash" = "$cache_hash" ]; then
+            local src_count
+            src_count=$(find "$SDK_SRC" -mindepth 1 -maxdepth 1 -not -name ".*-installed" -not -name ".git" 2>/dev/null | wc -l)
+            if [ "$src_count" -gt 0 ]; then
+                return 1
             fi
+        fi
+    fi
+
+    local current
+    current=$(current_game_in_src)
+    if [ -n "$current" ] && [ "$current" != "user-game" ]; then
+        backup_src "$current"
+    elif [ -n "$current" ] && [ "$current" = "user-game" ]; then
+        read -p "  Jogo do usuário em src/. Fazer backup antes de substituir? (s/n): " _ans
+        if [[ "$_ans" =~ ^[Ss]$ ]]; then
+            backup_src "user-game"
         else
-            echo "  Jogo do usuário detectado em $SDK_SRC. Preservando."
-            return 0
+            echo "  Aviso: backup ignorado. O jogo atual será perdido."
         fi
     fi
 
-    # Só agora: backup + limpeza + cópia
-    backup_src "$demo_name"
+    echo "  Instalando '$demo_name' em src/..."
+    find "$SDK_SRC" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 
-    if [ -f "$marker" ] || [ "$user_game" -eq 0 ]; then
-        if [ -n "$(ls -A "$SDK_SRC" 2>/dev/null)" ] && [ -f "$marker" ]; then
-            echo "  Limpando src/ antes de reinstalar..."
-            find "$SDK_SRC" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-        fi
-    fi
-
-        # Verifica que o cache realmente tem conteúdo
-    local cache_file_count
-    cache_file_count=$(find "$demo_src" -mindepth 1 -maxdepth 1 -not -name ".git" 2>/dev/null | wc -l)
-    if [ "$cache_file_count" -eq 0 ]; then
-        echo "  Erro: cache de $demo_name está vazio (só .git). Pulando cópia."
-        echo "  Tente: rm -rf $demo_src && ./build-lupi.sh"
-        return 1
-    fi
-
-    echo "  Copiando $demo_name de $demo_src para $SDK_SRC..."
     find "$demo_src" -mindepth 1 -maxdepth 1 -not -name ".git" -exec cp -a {} "$SDK_SRC/" \;
-
     find "$SDK_SRC" -name ".git" -mindepth 1 -maxdepth 3 -exec rm -rf {} + 2>/dev/null || true
 
-    if [ -n "$cache_hash" ]; then
-        echo "$cache_hash" > "$marker"
-    else
-        touch "$marker"
-    fi
-    echo "  Arquivos de $demo_name copiados (commit ${cache_hash:0:8})."
+    rm -f "$SDK_SRC"/.*-installed
+    write_demo_marker "$marker" "$cache_hash"
+    echo "  '$demo_name' instalado (commit ${cache_hash:0:8})."
+
+    get_src_content_hash > "$SRC_HASH_FILE"
+    return 0
 }
 
-# --- Análise de artefatos do Furnace ---
+# --- Furnace ---
 furnace_cache_is_stale() {
     local cache_file="$LUPINHO_DIR/src/music/furnace-build-web/CMakeCache.txt"
     [ ! -f "$cache_file" ] && return 1
@@ -666,12 +919,60 @@ check_furnace_setup() {
     esac
 }
 
+detect_old_build_mode() {
+    if [ -f "$LUPINHO_DIR/src/main.debug.web.o" ]; then
+        echo "dev"
+    elif [ -f "$LUPINHO_DIR/src/main.web.o" ]; then
+        echo "game"
+    else
+        echo ""
+    fi
+}
+
+lupinho_build_usable_for_mode() {
+    local dist="$LUPINHO_SITE/dist"
+    [ -f "$dist/game.wasm" ] && [ -f "$dist/game.html" ] && [ -f "$dist/game.js" ] || return 1
+
+    local built_mode=""
+    [ -f "$dist/.build-mode" ] && built_mode=$(cat "$dist/.build-mode" 2>/dev/null)
+
+    if [ "$built_mode" = "$MODE" ]; then
+        return 0
+    fi
+
+    if [ -z "$built_mode" ]; then
+        return 1
+    fi
+
+    if [ "$MODE" = "dev" ] && [ "$built_mode" = "game" ]; then
+        return 1
+    fi
+
+    return 0
+}
+
 check_lupinho_build() {
     [ ! -d "$LUPINHO_DIR" ] && { echo "Erro: pasta 'lupinho' não encontrada."; exit 1; }
 
     local dist="$LUPINHO_SITE/dist"
     local fur_obj="$LUPINHO_DIR/src/libs/web/furnace-web/fur_player-web.o"
     local libfile="$LUPINHO_DIR/src/libs/web/furnace-web/libfurengine.a"
+
+    if [ -d "$dist" ] && [ -f "$dist/game.wasm" ] && [ ! -f "$dist/.build-mode" ]; then
+        local detected
+        detected=$(detect_old_build_mode)
+        if [ -n "$detected" ]; then
+            echo "  Build antigo detectado: modo '$detected'."
+            echo "$detected" > "$dist/.build-mode"
+        else
+            echo "  Build antigo: modo indeterminado, assumindo '$MODE'."
+            echo "$MODE" > "$dist/.build-mode"
+        fi
+    fi
+
+    local built_mode=""
+    [ -f "$dist/.build-mode" ] && built_mode=$(cat "$dist/.build-mode" 2>/dev/null)
+    [ -n "$built_mode" ] && echo "  Build atual em site/dist: $built_mode"
 
     local need=0 missing=""
     if [ ! -d "$dist" ]; then
@@ -681,6 +982,11 @@ check_lupinho_build() {
         [ ! -f "$dist/game.html" ] && missing="$missing game.html"
         [ ! -f "$dist/game.js" ]   && missing="$missing game.js"
         [ -n "$missing" ] && { need=1; echo "Arquivos ausentes em site/dist:$missing"; }
+    fi
+
+    if [ "$need" -eq 0 ] && ! lupinho_build_usable_for_mode; then
+        echo "Aviso: build em '$built_mode' mas modo atual exige '$MODE'. Recompilando."
+        need=1
     fi
 
     local obj_stale=0
@@ -702,10 +1008,7 @@ check_lupinho_build() {
         if [ "$MODE" != "dev" ] && [ ! -f "$fur_obj" ]; then
             echo ""
             echo "ATENÇÃO: fur_player-web.o ausente em GAME mode."
-            echo "  Esse arquivo deveria estar commitado em lupinho/src/libs/web/furnace-web/."
-            echo "  Sem ele, 'make web' falha no link."
-            echo "  Solução: rode uma vez em DEV mode (gera o .o), ou"
-            echo "  commite o .o de volta no repo Hirikko/lupinho:dev."
+            echo "  Solução: rode uma vez em DEV mode (gera o .o)."
             echo ""
         fi
 
@@ -739,72 +1042,145 @@ check_lupinho_build() {
         if [ ! -f "$dist/game.wasm" ] || [ ! -f "$dist/game.html" ] || [ ! -f "$dist/game.js" ]; then
             echo "Erro: compilação do Lupinho falhou."; exit 1
         fi
-        echo "Lupinho compilado com sucesso."
+        echo "$MODE" > "$dist/.build-mode"
+        echo "Lupinho compilado com sucesso (modo: $MODE)."
     else
-        echo "Lupinho já compilado."
+        echo "Lupinho já compilado (modo: $MODE, reuso do build existente)."
     fi
 }
 
-# --- Verificação e download ---
+migrate_mode_to_select() {
+    if [ -f "$SELECT_FILE" ] && grep -qE '^jogo=' "$SELECT_FILE" 2>/dev/null; then
+        return 0
+    fi
+    if [ ! -f "$SELECT_FILE" ] && [ -f "$MODE_FILE" ]; then
+        local _old
+        _old=$(cat "$MODE_FILE" 2>/dev/null | tr -d '[:space:]')
+        case "$_old" in
+            dev)  printf "jogo=lupinho-debug-lab\nseletor=liga\n" > "$SELECT_FILE" ;;
+            game) printf "jogo=caio-pernocas\nseletor=liga\n" > "$SELECT_FILE" ;;
+            user) printf "jogo=user\nseletor=liga\n" > "$SELECT_FILE" ;;
+        esac
+        if [ -f "$SELECT_FILE" ]; then
+            echo "  Migração: .lupi-mode ($_old) → .lupi-select (jogo=$(select_get_jogo), seletor=liga)"
+            rm -f "$MODE_FILE"
+        fi
+    fi
+}
+
 check_dependencies() {
     local MISSING=0
     [ ! -d "$LUPINHO_DIR" ] && MISSING=1
     [ ! -d "$SDK_DIR" ] && MISSING=1
     [ ! -d "$CODEC_DIR" ] && MISSING=1
 
-    if [ "$MISSING" -eq 1 ]; then
-        step " Dependências faltando"
-        echo "Deseja baixar a versão DEV (completa) ou GAME (somente essencial)?"
-        read -p "[dev/game]: " vc
-        case "$vc" in
-            dev)
-                echo "Baixando dependências (versão DEV)..."
-                MODE="dev"; printf "%s" "$MODE" > "$MODE_FILE"
-                git_sync_dir "$LUPINHO_DIR" "https://github.com/Hirikko/lupinho.git" "dev"
-                git_sync_dir "$SDK_DIR" "https://github.com/lupi-org-br/lupinho-sdk.git"
-                git_sync_dir "$CODEC_DIR" "https://github.com/Hirikko/lupi-codec.git" "upgrades"
-                sync_demo_caches
-                install_furnace
-                install_wav2vgm
-                install_vgm2fur
-                install_demo_from_cache "lupinho-debug-lab"
-                ;;
-            game)
-                echo "Baixando dependências (versão GAME)..."
-                MODE="game"; printf "%s" "$MODE" > "$MODE_FILE"
-                git_sync_dir "$LUPINHO_DIR" "https://github.com/Hirikko/lupinho.git" "dev"
-                git_sync_dir "$SDK_DIR" "https://github.com/lupi-org-br/lupinho-sdk.git"
-                git_sync_dir "$CODEC_DIR" "https://github.com/Hirikko/lupi-codec.git" "upgrades"
-                sync_demo_caches
-                install_demo_from_cache "caio-pernocas"
-                echo "Nota: GAME não inclui ferramentas DEV (furnace, wav2vgm, vgm2fur)."
-                ;;
-            *) echo "Opção inválida."; exit 1 ;;
-        esac
-    else
-        if [ -f "$MODE_FILE" ]; then MODE=$(cat "$MODE_FILE")
-        elif [ -f "$SDK_SRC/.caio-pernocas-installed" ]; then MODE="game"
-        elif [ -f "$SDK_SRC/.lupinho-debug-lab-installed" ]; then MODE="dev"
-        elif [ -f "$SDK_SRC/main.lua" ] || [ -f "$SDK_SRC/game.lua" ] || [ -f "$SDK_SRC/lupi.yaml" ]; then MODE="user"
-        fi
+    migrate_mode_to_select
+    select_migrate
+    migrate_flat_backups
 
-        echo "Verificando atualizações (modo: ${MODE:-desconhecido})..."
+    if [ "$MISSING" -eq 1 ]; then
+        echo "Clonando repositórios base (primeira execução)..."
         git_sync_dir "$LUPINHO_DIR" "https://github.com/Hirikko/lupinho.git" "dev"
         git_sync_dir "$SDK_DIR" "https://github.com/lupi-org-br/lupinho-sdk.git"
         git_sync_dir "$CODEC_DIR" "https://github.com/Hirikko/lupi-codec.git" "upgrades"
-        sync_demo_caches
+        install_build_lupi
+    fi
 
-        if [ "$MODE" = "dev" ]; then
-            install_furnace
-            install_wav2vgm
-            install_vgm2fur
-            install_demo_from_cache "lupinho-debug-lab"
-        elif [ "$MODE" = "game" ]; then
-            install_demo_from_cache "caio-pernocas"
+    local already_selected=0
+    if [ ! -f "$SELECT_FILE" ]; then
+        echo "  Primeira execução: criando .lupi-select (seletor=liga por padrão)."
+        choose_game_selection
+        already_selected=1
+    fi
+
+    local cur_seletor cur_jogo
+    cur_seletor=$(select_get_seletor)
+    cur_jogo=$(select_get_jogo)
+
+    if [ "$already_selected" -eq 1 ]; then
+        GAME_SELECTION="$cur_jogo"
+    elif [ "$FORCE_SELECT" -eq 1 ]; then
+        choose_game_selection
+        GAME_SELECTION=$(select_get_jogo)
+    elif [ "$cur_seletor" = "desliga" ]; then
+        GAME_SELECTION="$cur_jogo"
+        echo "  seletor=desliga: usando '$GAME_SELECTION' (src/ preservado)"
+    elif [ -n "$CLI_GAME" ]; then
+        GAME_SELECTION="$CLI_GAME"
+        select_set_jogo "$GAME_SELECTION"
+        echo "  Seleção via CLI: $GAME_SELECTION"
+    else
+        choose_game_selection
+        GAME_SELECTION=$(select_get_jogo)
+    fi
+
+    [ -z "$GAME_SELECTION" ] && { echo "Erro: nenhum jogo selecionado."; exit 1; }
+
+    case "$GAME_SELECTION" in
+        caio-pernocas)     MODE="game" ; GAME_NAME="caio-pernocas" ;;
+        lupinho-debug-lab) MODE="dev"  ; GAME_NAME="lupinho-debug-lab" ;;
+        *)
+            MODE="user"
+            GAME_NAME="$GAME_SELECTION"
+            if [ ! -d "$DEMOS_DIR/$GAME_SELECTION" ]; then
+                echo "Seleção '$GAME_SELECTION' inválida (pasta não existe em jogos-demo/)."
+                exit 1
+            fi
+            ;;
+    esac
+
+    echo "Jogo selecionado: $GAME_SELECTION (modo: $MODE)"
+
+    if [ "$FORCE_SELECT" -eq 1 ] && [ "$cur_seletor" = "desliga" ]; then
+        echo "  Aviso: --select não altera a flag. Para trocar permanentemente, use --cfg seletor=liga."
+    fi
+
+    echo "Verificando atualizações..."
+
+    git_sync_dir "$LUPINHO_DIR" "https://github.com/Hirikko/lupinho.git" "dev"
+    git_sync_dir "$SDK_DIR" "https://github.com/lupi-org-br/lupinho-sdk.git"
+    git_sync_dir "$CODEC_DIR" "https://github.com/Hirikko/lupi-codec.git" "upgrades"
+    install_build_lupi
+    sync_demo_caches
+
+    if [ "$MODE" = "dev" ]; then
+        install_furnace
+        install_wav2vgm
+        install_vgm2fur
+    fi
+
+    if [ "$cur_seletor" = "desliga" ] && [ "$FORCE_SELECT" -eq 0 ]; then
+        check_src_changes_on_every_run
+        echo "  src/ preservado (seletor=desliga)."
+        return 0
+    fi
+
+    local current_in_src
+    current_in_src=$(current_game_in_src)
+
+    if [ "$current_in_src" = "$GAME_SELECTION" ]; then
+        echo "  $GAME_SELECTION já instalado."
+        check_src_changes_on_every_run
+        return 0
+    fi
+
+    if [ -n "$current_in_src" ]; then
+        echo "  Jogo atual em src/: $current_in_src → trocando para $GAME_SELECTION"
+        if [ "$current_in_src" = "user-game" ]; then
+            if [ -n "$CLI_GAME" ]; then
+                backup_src "user-game"
+            else
+                read -p "  Fazer backup do jogo do usuário? (s/n): " _ans
+                if [[ "$_ans" =~ ^[Ss]$ ]]; then
+                    backup_src "user-game"
+                fi
+            fi
         else
-            echo "Modo 'user': demos não serão instalados em src/."
+            backup_src "$current_in_src"
         fi
     fi
+
+    swap_src_to_demo "$GAME_SELECTION" || true
 }
 
 # ===========================================
@@ -817,7 +1193,6 @@ check_dependencies
 
 check_furnace_setup
 
-# Nome do jogo
 if [ -z "$GAME_NAME" ] && [ -f "$SDK_SRC/lupi.yaml" ]; then
     GAME_NAME=$(grep -E '^name:' "$SDK_SRC/lupi.yaml" 2>/dev/null | head -n1 | sed -E 's/^name:[[:space:]]*//' | tr -d '"' | tr -d "'" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')
 fi
